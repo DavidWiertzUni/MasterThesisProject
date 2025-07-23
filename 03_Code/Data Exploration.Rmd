@@ -1,0 +1,70 @@
+---
+title: "Data Exploration"
+output: html_document
+---
+
+```{r}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+
+```{r}
+charging_points_raw<- read_csv("../01_Raw_Data/Electric_Vehicle_Charging_Points_2765336306591006216.csv")
+charging_session_raw <- read_csv("..-/01_Raw_Data/EVChargeStationUseSept2018toAug2019.csv")
+
+```
+
+```{r}
+cat("Charging Points Summary:\n")
+glimpse(charging_points_raw)
+cat("\nCharging Sessions Summary:\n")
+glimpse(charging_session_raw)
+```
+
+```{r}
+cat("\nMissing values in Charging Points:\n")
+colSums(is.na(charging_points_raw))
+cat("\nMissing values in Charging Sessions:\n")
+colSums(is.na(charging_session_raw))
+```
+
+```{r}
+ggplot(charging_points_raw, aes(x = x, y = y)) +
+  geom_point(color = "blue") +
+  labs(title = "Charging Point Locations", x = "Longitude", y = "Latitude") +
+  theme_minimal()
+```
+
+```{r}
+charging_session_raw <- charging_session_raw %>%
+  rename(Id = `CP ID`)
+
+usage_count <- charging_session_raw %>%
+  count(Id, sort = TRUE) %>%
+  rename(num_sessions = n)
+```
+
+```{r}
+most_used_stations <- usage_count %>%
+  left_join(charging_points_raw, by = "Id")
+
+# View top 10 most used stations
+head(most_used_stations, 10)
+
+# 5. Visualize Most Used Stations on Map
+ggplot(most_used_stations, aes(x = x, y = y, size = num_sessions)) +
+  geom_point(alpha = 0.7, color = "red") +
+  labs(title = "Most Used Charging Stations", x = "Longitude", y = "Latitude", size = "Sessions") +
+  theme_minimal()
+```
+
+```{r}
+top10 <- usage_count %>% head(10)
+ggplot(top10, aes(x = reorder(as.factor(Id), num_sessions), y = num_sessions)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Top 10 Most Used Charging Stations", x = "Charging Point ID", y = "Number of Sessions") +
+  theme_minimal()
+```
