@@ -78,7 +78,7 @@ coords <- st_coordinates(most_used_stations_latlon)
 most_used_stations_latlon$lon <- coords[, 1]
 most_used_stations_latlon$lat <- coords[, 2]
 pal <- colorNumeric(
-  palette = "YlOrRd", # yellow-orange-red
+  palette = "YlOrRd", 
   domain = most_used_stations_latlon$num_sessions
 )
 leaflet(data = most_used_stations_latlon) %>%
@@ -139,6 +139,8 @@ charging_session_raw %>%
     labs(title = "Charging Sessions by Hour of Day", x = "Hour", y = "Sessions")
 ```
 
+-   charging session duration distribution
+
 ```{r}
 charging_session_raw <- charging_session_raw %>%
   mutate(
@@ -148,13 +150,13 @@ charging_session_raw <- charging_session_raw %>%
     duration_hours = as.numeric(difftime(EndDateTime, StartDateTime, units = "hours"))
   )
 charging_session_raw %>%
-  filter(duration_minutes > 0) %>%
+ # filter(duration_minutes > 0) %>%
   ggplot(aes(x = duration_minutes)) +
     geom_histogram(binwidth = 0.1, fill = "skyblue", color = "white") +
     scale_x_log10(
       breaks = c(1, 2, 5, 10, 20, 30, 60, 120, 240, 480, 1000),
       labels = c("1", "2", "5", "10", "20", "30", "60", "120", "240", "480", "1000")
-    ) +
+  )+
     labs(
       title = "Distribution of Charging Session Durations (Log Scale)",
       x = "Duration (minutes, log10 scale)",
@@ -164,17 +166,57 @@ charging_session_raw %>%
 ```
 
 ```{r}
+charging_session_raw %>%
+  #filter(duration_minutes > 0, `Total kWh` > 0, `Total kWh`< 100) %>%
+  ggplot(aes(x = `Total kWh`)) +
+    geom_histogram(binwidth = 5, fill = "skyblue", color = "white")  + scale_x_continuous(
+      breaks = seq(0, 300, 5)
+    ) +
+    labs(
+      title = "Distribution of Delivered Charging Energy",
+      x = "Energy delivered (kWh)",
+      y = "Number of Sessions"
+    ) + theme_minimal()
+```
+
+-\> I need to filter the sessions with \<0min; \> 1440 min (1 Day); kwh \< 0kWh; These sessions are most probably faulty.
+
+```{}
+```
+
+-\> I need to filter the sessions with \<0min; \> 1440 min (1 Day); kwh \< 0kWh; These sessions are most probably faulty.
+
+```{r}
+charging_sessions_filtered <- charging_session_raw %>%
+  mutate(
+    StartDateTime = ymd_hms(paste(`Start Date`, `Start Time`)),
+    EndDateTime   = ymd_hms(paste(`End Date`, `End Time`)),
+    duration_minutes = as.numeric(difftime(EndDateTime, StartDateTime, units = "mins"))
+  ) %>%
+  filter(
+    duration_minutes >= 0,       # remove negative durations
+    duration_minutes <= 1440,    # remove sessions longer than 1 day
+    `Total kWh` > 0                      # remove sessions with negative or zero kWh
+  )
+
+# Save to Processed folder
+write_csv(charging_sessions_filtered, "../02_Processed_Data/charging_sessions_filtered.csv")
+```
+
+Top 10 Charging Station Boxplot; Brauche ich vermutlich nicht.
+
+```{r}
 charging_session_raw <- charging_session_raw %>%
   mutate(
     StartDateTime = ymd_hms(paste(`Start Date`, `Start Time`)),
     EndDateTime = ymd_hms(paste(`End Date`, `End Time`)),
     duration_minutes = as.numeric(difftime(EndDateTime, StartDateTime, units = "mins"))
   ) %>%
-  filter(duration_minutes > 0)
+  filter(duration_minutes > 0, duration_minutes <= 1440)
+
 filtered_data <- charging_session_raw %>%
   filter(duration_minutes <= quantile(duration_minutes, 0.99, na.rm = TRUE))
 
-# Boxplot
 ggplot(filtered_data, aes(x = as.factor(Id), y = duration_minutes)) +
   geom_boxplot(outlier.alpha = 0.25, fill = "lightgreen") +
   labs(
@@ -185,3 +227,11 @@ ggplot(filtered_data, aes(x = as.factor(Id), y = duration_minutes)) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
+
+Feature Engineering:
+
+1.  Time based & Location features already in the dataset;
+2.  Mapping of shortest distance to the next station;
+3.  Mapping of nearest Street classification (Bundesstraße, Landstraße...)
+4.  mapping of nearest point of interest & the classification of it;
+    1.  Supermarket; Highway station;
