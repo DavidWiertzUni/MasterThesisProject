@@ -568,106 +568,505 @@ library(dplyr)
 library(sf)
 library(osmdata)
 library(dodgr)
+library(geodist)
 
-# ==== input: stations with lon/lat (WGS84) ====
-# Use your table that holds one row per station and lon/lat, e.g. charging_points_geo
+# --- stations (Id, lon, lat) in WGS84
 stations <- charging_points_geo %>%
   filter(!is.na(lon), !is.na(lat)) %>%
   distinct(Id, lon, lat)
 
 stations_sf <- st_as_sf(stations, coords = c("lon", "lat"), crs = 4326)
 
-# ==== build a buffered bbox around stations (to ensure roads cover all points) ====
-# buffer 10 km (in meters) in a projected CRS then back to WGS84
-bb_poly <- stations_sf %>%
-  st_union() %>%
-  st_transform(3857) %>%              # Web Mercator in meters
-  st_buffer(10000) %>%                # 10 km buffer
-  st_transform(4326)
+# --- buffered bbox so the graph covers all stations
+bb_poly <- stations_sf %>% st_union() %>% st_transform(3857) %>% st_buffer(10000) %>% st_transform(4326)
 bb <- st_bbox(bb_poly)
 
+# --- download only DRIVABLE highways
 hw_keep <- c(
-  "motorway","motorway_link",
-  "trunk","trunk_link",
-  "primary","primary_link",
-  "secondary","secondary_link",
-  "tertiary","tertiary_link",
+  "motorway","motorway_link","trunk","trunk_link","primary","primary_link",
+  "secondary","secondary_link","tertiary","tertiary_link",
   "unclassified","residential","living_street","service"
 )
-
-q <- opq(bbox = bb) %>% add_osm_feature(key = "highway", value = hw_keep)
-net <- osmdata_sf(q)
-
+net <- opq(bbox = bb) %>% add_osm_feature("highway", hw_keep) %>% osmdata_sf()
 roads <- net$osm_lines
-if (is.null(roads) || nrow(roads) == 0) {
-  stop("No OSM road lines were returned for the area. Try increasing the buffer distance.")
-}
-
-# drop any stragglers that slipped through (construction/proposed/disused)
+stopifnot(!is.null(roads), nrow(roads) > 0)
 bad <- c("construction","proposed","disused")
-if ("highway" %in% names(roads)) {
-  roads <- roads[!(roads$highway %in% bad), ]
-}
+if ("highway" %in% names(roads)) roads <- roads[!(roads$highway %in% bad), ]
 
-# ==== build a drivable graph & keep the giant component ====
+# --- build weighted graph (DO NOT contract here)
 graph <- weight_streetnet(roads, wt_profile = "motorcar")
-graph <- dodgr_contract_graph(graph)
 
-# Keep only the largest connected component so everything is routable
-comp <- dodgr_components(graph)
-largest <- which.max(comp$csize)
-graph <- graph[graph$component == largest, ]
+# --- use coordinates directly for distances (lon,lat as numeric matrix)
+xy <- st_coordinates(stations_sf)        # columns: X=lon, Y=lat
+dmat_m <- dodgr_dists(graph, from = xy, to = xy)  # meters
 
-# ==== map stations onto the graph vertices ====
-coords <- st_coordinates(stations_sf)
-v_ids <- match_pts_to_graph(graph, coords)  # returns vertex ids (or NA if too far)
-
-# Fallback: any NA still? try snapping to nearest edge vertices by expanding search
-if (any(is.na(v_ids))) {
-  # crude fallback: use nearest graph vertex by kd-tree (fast)
-  verts <- dodgr_vertices(graph)
-  nn <- FNN::get.knnx(verts[, c("x","y")], coords, k = 1)$nn.index
-  v_ids[is.na(v_ids)] <- verts$id[nn[is.na(v_ids)]]
-  # if FNN not available, you could use a slower spatial join instead.
-}
-
-# If still NA (very unlikely now): mark for geodesic fallback
-unmatched <- which(is.na(v_ids))
-
-# ==== compute pairwise road distances (meters) ====
-dmat_m <- dodgr_dists(graph, from = v_ids, to = v_ids)
-
-# ==== nearest other station by road distance ====
+# --- nearest OTHER station by road distance
 nearest_m <- apply(dmat_m, 1, function(v) {
+  v <- as.numeric(v)
   vpos <- v[is.finite(v) & v > 0]
   if (length(vpos)) min(vpos) else NA_real_
 })
 
-nn_df <- tibble(
+nn_df <- tibble::tibble(
   Id = stations$Id,
-  nearest_station_dist_km = as.numeric(nearest_m) / 1000
+  nearest_station_dist_km = nearest_m / 1000
 )
 
-# ==== fallback for any NA distances: use geodesic distance ====
-if (any(is.na(nn_df$nearest_station_dist_km))) {
-  # compute straight-line distances and fill only NAs
-  dist_geo <- st_distance(stations_sf, stations_sf) # meters, diagonal zero
+# --- optional fallback: if any NA, fill with geodesic nearest
+if (anyNA(nn_df$nearest_station_dist_km)) {
+  dist_geo <- st_distance(stations_sf, stations_sf)  # meters
   nearest_geo_m <- apply(dist_geo, 1, function(v) {
-    vpos <- as.numeric(v)
-    vpos <- vpos[vpos > 0 & is.finite(vpos)]
+    v <- as.numeric(v)
+    vpos <- v[is.finite(v) & v > 0]
     if (length(vpos)) min(vpos) else NA_real_
   })
-  fill_idx <- which(is.na(nn_df$nearest_station_dist_km))
-  nn_df$nearest_station_dist_km[fill_idx] <- nearest_geo_m[fill_idx] / 1000
+  fill <- which(is.na(nn_df$nearest_station_dist_km))
+  nn_df$nearest_station_dist_km[fill] <- nearest_geo_m[fill] / 1000
 }
 
-# ==== join back to your daily table ====
-station_day <- station_day %>%
-  left_join(nn_df, by = "Id")
+# --- join back to daily table
+station_day <- station_day %>% left_join(nn_df, by = "Id")
 
-# quick sanity check
+# quick check
 summary(station_day$nearest_station_dist_km)
 
+```
 
+FIRST ML run (gradient boosting):\
+\
+
+```{r}
+df <- station_day %>%
+  transmute(
+    Id, date,
+    log_energy = log1p(energy_per_day_kWh),
+    dow   = factor(wday(date, label = TRUE)),
+    month = factor(month(date)),
+    lon, lat,
+    nearest_station_dist_km,
+    CH_SPEED = factor(CH_SPEED),
+    CH_TYPE  = factor(CH_TYPE)
+  ) %>%
+  tidyr::drop_na(log_energy, dow, month, lon, lat, nearest_station_dist_km, CH_SPEED, CH_TYPE)
+
+X <- model.matrix(
+  log_energy ~ dow + month + lon + lat + nearest_station_dist_km + CH_SPEED + CH_TYPE - 1,
+  data = df
+)
+y <- df$log_energy
+
+cutoff <- as.Date("2019-07-01")
+if (!any(df$date < cutoff) || !any(df$date >= cutoff)) {
+
+  cutoff <- sort(unique(df$date))[floor(length(unique(df$date)) * 0.8)]
+}
+train_idx <- which(df$date < cutoff)
+
+dtrain <- xgb.DMatrix(data = X[train_idx, , drop = FALSE], label = y[train_idx])
+dtest  <- xgb.DMatrix(data = X[-train_idx, , drop = FALSE], label = y[-train_idx])
+
+params <- list(objective = "reg:squarederror", eval_metric = "rmse", eta = 0.1, max_depth = 6)
+bst <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 500,
+  watchlist = list(train = dtrain, eval = dtest),
+  early_stopping_rounds = 20,
+  print_every_n = 10
+)
+
+pred_log <- predict(bst, dtest)
+pred_kWh <- expm1(pred_log)
+
+true_kWh <- expm1(y[-train_idx])
+rmse <- sqrt(mean((pred_kWh - true_kWh)^2))
+mae  <- mean(abs(pred_kWh - true_kWh))
+cat("Cutoff:", as.character(cutoff), "\nRMSE:", round(rmse,2), "kWh  MAE:", round(mae,2), "kWh\n")
+
+print(utils::head(xgb.importance(model = bst), 15))
+```
+
+```{r}
+stations <- charging_points_geo %>%
+  filter(!is.na(lon), !is.na(lat)) %>%
+  distinct(Id, lon, lat)
+
+stations_sf <- st_as_sf(stations, coords = c("lon","lat"), crs = 4326)
+
+# Work CRS in meters (for buffering/lengths)
+crs_m <- 3857
+stations_m <- st_transform(stations_sf, crs_m)
+
+# ==== (A) Population density in a ring around station ====
+# Provide a population raster (e.g., WorldPop/GEOSTAT) in WGS84:
+# Put your file at: ../01_Raw_Data/pop_density.tif  (people per km^2)
+pop_raster_path <- "../01_Raw_Data/pop_density.tif"   # <-- CHANGE to your file
+stopifnot(file.exists(pop_raster_path))
+pop_r <- rast(pop_raster_path)  # terra raster
+
+# buffer (meters)
+buf_pop_m <- 1000  # 1 km
+ring_pop_m <- 100  # inner hole to avoid exact point artifact; set 0 for full buffer
+
+# create ring polygons in meters, then back to WGS84 for terra::extract
+rings_m <- st_buffer(stations_m, buf_pop_m)
+if (ring_pop_m > 0) rings_m <- st_difference(rings_m, st_buffer(stations_m, ring_pop_m))
+rings_ll <- st_transform(rings_m, 4326)
+
+# extract mean pop density
+pop_vals <- terra::extract(pop_r, vect(rings_ll), fun = mean, na.rm = TRUE)
+# 'ID' is auto; align to stations by row
+stations_pop <- stations %>%
+  mutate(pop_density_mean_1km = pop_vals[[2]])  # 2nd column is the raster value
+
+# ==== (B) Road classification & density (OSM) ====
+# Download drivable highways within a big bbox covering all stations (+buffer)
+bbox_large <- st_bbox(st_buffer(st_transform(stations_sf, 4326), 0.2)) # ~0.2 degrees pad
+hw_keep <- c(
+  "motorway","motorway_link","trunk","trunk_link","primary","primary_link",
+  "secondary","secondary_link","tertiary","tertiary_link",
+  "unclassified","residential","living_street","service"
+)
+
+roads_osm <- opq(bbox = bbox_large) %>%
+  add_osm_feature(key = "highway", value = hw_keep) %>%
+  osmdata_sf()
+
+roads <- roads_osm$osm_lines
+stopifnot(!is.null(roads), nrow(roads) > 0)
+
+# clean & go to meter CRS
+bad <- c("construction","proposed","disused")
+if ("highway" %in% names(roads)) roads <- roads[!(roads$highway %in% bad), ]
+roads_m <- st_transform(roads, crs_m)
+stations_m <- st_transform(stations_sf, crs_m)  # ensure same CRS
+
+# (B1) nearest road class (categorical)
+nearest_idx <- st_nearest_feature(stations_m, roads_m)
+nearest_class <- roads_m$highway[nearest_idx]
+
+# (B2) road length by class within buffer
+buf_rd_m <- 500  # 500 m neighborhood
+neighb <- st_buffer(stations_m, buf_rd_m)
+
+# intersect once (faster than per-station loops)
+intersections <- st_intersection(roads_m, st_union(neighb))
+# compute lengths (in meters) by feature
+intersections$len_m <- as.numeric(st_length(intersections))
+
+# tag each piece with the station it belongs to (spatial join to which buffer)
+ints_to_station <- st_join(intersections, st_sf(station_id = stations$Id, geometry = neighb))
+# aggregate length by station & class
+road_len_by_class <- ints_to_station %>%
+  st_drop_geometry() %>%
+  group_by(station_id, highway) %>%
+  summarise(road_len_m = sum(len_m, na.rm = TRUE), .groups = "drop")
+
+# make wide (one col per class), also total density (m per km^2) in the buffer
+buf_area_km2 <- set_units(pi * (buf_rd_m^2), m^2)
+buf_area_km2 <- as.numeric(set_units(buf_area_km2, km^2))
+road_len_wide <- tidyr::pivot_wider(
+  road_len_by_class,
+  id_cols = station_id,
+  names_from = highway,
+  values_from = road_len_m,
+  values_fill = 0
+) %>%
+  mutate(
+    road_len_total_m = rowSums(across(where(is.numeric))),
+    road_density_m_per_km2 = road_len_total_m / buf_area_km2
+  ) %>%
+  rename(Id = station_id)
+
+# ==== (C) Distance to nearest city/town center (OSM) ====
+# Query city & town places (points/polygons)
+places <- opq(bbox = bbox_large) %>%
+  add_osm_feature(key = "place", value = c("city","town")) %>%
+  osmdata_sf()
+
+# unify points & polygon centroids
+cities_pts <- places$osm_points
+cities_poly <- places$osm_multipolygons
+cities <- list()
+
+if (!is.null(cities_pts) && nrow(cities_pts) > 0) {
+  cities[[length(cities)+1]] <- st_transform(cities_pts, 4326) %>% select(name, place, geometry)
+}
+if (!is.null(cities_poly) && nrow(cities_poly) > 0) {
+  cent <- st_point_on_surface(st_transform(cities_poly, 4326))
+  cities[[length(cities)+1]] <- cent %>% select(name, place, geometry)
+}
+stopifnot(length(cities) > 0)
+cities_all <- do.call(rbind, cities)
+
+# compute nearest city distance (km)
+dist_mat <- st_distance(stations_sf, cities_all)  # meters
+nearest_city_km <- apply(dist_mat, 1, function(v) {
+  v <- as.numeric(v)
+  if (all(!is.finite(v))) NA_real_ else min(v, na.rm = TRUE) / 1000
+})
+
+# ==== (D) collect all station-level features ====
+stations_features <- stations_pop %>%
+  mutate(nearest_road_class = nearest_class,
+         dist_to_city_km = nearest_city_km) %>%
+  left_join(road_len_wide, by = "Id")
+
+# ==== (E) join into station_day ====
+station_day <- station_day %>%
+  left_join(stations_features, by = "Id")
+```
+
+Population Data ; Feature engineering:\
+
+```{r}
+# 0) Stations (WGS84 + BNG)
+stations_ll  <- st_as_sf(charging_points_geo, coords = c("lon","lat"), crs = 4326, remove = FALSE)
+stations_bng <- st_transform(stations_ll, 27700)
+
+# 1) Crop & reproject raster to BNG
+buf_m  <- 10000
+area_bng <- st_buffer(st_union(stations_bng), buf_m)
+bb_ll   <- st_bbox(st_transform(area_bng, 4326))
+
+pop_path <- "../01_Raw_Data/population_UK.tif"  # your file
+pop_r_ll <- rast(pop_path)
+pop_r_cr <- crop(pop_r_ll, ext(bb_ll))
+pop_r_bng <- project(pop_r_cr, "EPSG:27700", method = "bilinear")
+
+# 2) Build rings **rowwise** so we get exactly one ring per station
+outer_list <- lapply(st_geometry(stations_bng), function(g) st_buffer(g, 1000))
+inner_list <- lapply(st_geometry(stations_bng), function(g) st_buffer(g,  100))
+ring_list  <- Map(st_difference, outer_list, inner_list)
+rings_bng  <- st_sfc(ring_list, crs = 27700)                  # length == nrow(stations_bng)
+rings_v    <- vect(rings_bng)
+
+# 3) Extract mean pop per ring → one row per station
+pop_df <- terra::extract(pop_r_bng, rings_v, fun = mean, na.rm = TRUE)
+# pop_df has columns: ID, <raster_name>. Use the 2nd column:
+pop_mean <- as.numeric(pop_df[[2]])
+
+stopifnot(length(pop_mean) == nrow(stations_ll))  # safety check
+
+# 4) Attach to stations, then to station_day
+station_pop <- charging_points_geo %>%
+  distinct(Id, lon, lat) %>%
+  mutate(pop_density_mean_1km = pop_mean)
+
+station_day <- station_day %>%
+  left_join(station_pop, by = "Id")
+```
+
+```{r}
+length(ring_list)        
+nrow(pop_df)             
+summary(station_day$pop_density_mean_1km)
 
 ```
+
+```{r}
+
+# ---- inputs ----
+# If you have charging_points_geo, derive 'stations' from it:
+stations <- charging_points_geo %>%
+  filter(!is.na(lon), !is.na(lat)) %>%
+  distinct(Id, lon, lat)
+
+# CRS for metric work in Scotland/GB
+crs_m <- 27700   # British National Grid (meters)
+
+# Station points in both CRSs
+stations_sf <- st_as_sf(stations, coords = c("lon","lat"), crs = 4326)
+stations_m  <- st_transform(stations_sf, crs_m)
+
+# ---- (1) OSM ROADS: nearest class + road density by class within buffer ----
+# bbox with small pad in degrees (for OSM query)
+bbox_large <- st_bbox(st_buffer(stations_sf, 0.2))  # ~0.2° pad
+
+hw_keep <- c(
+  "motorway","motorway_link","trunk","trunk_link","primary","primary_link",
+  "secondary","secondary_link","tertiary","tertiary_link",
+  "unclassified","residential","living_street","service"
+)
+
+roads_osm <- opq(bbox = bbox_large) %>%
+  add_osm_feature(key = "highway", value = hw_keep) %>%
+  osmdata_sf()
+
+roads <- roads_osm$osm_lines
+stopifnot(!is.null(roads), nrow(roads) > 0)
+
+# Drop non-drivable stragglers and go to meters CRS
+bad <- c("construction","proposed","disused")
+if ("highway" %in% names(roads)) roads <- roads[!(roads$highway %in% bad), ]
+roads_m <- st_transform(roads, crs_m)
+
+# (1a) nearest road class per station
+nearest_idx   <- st_nearest_feature(stations_m, roads_m)
+nearest_class <- roads_m$highway[nearest_idx]
+
+# (1b) road length by class within buffer per station
+buf_rd_m   <- 500
+buffers_sf <- st_buffer(stations_m, buf_rd_m) %>%
+  mutate(station_id = stations$Id) %>%      # tag each buffer with station Id
+  select(station_id)
+
+# Intersect roads with each buffer -> each piece inherits station_id
+ints <- st_intersection(roads_m %>% select(highway), buffers_sf)
+if (nrow(ints) == 0) stop("No road segments intersect the station buffers. Increase buf_rd_m or check CRS.")
+
+road_len_by_class <- ints %>%
+  mutate(len_m = as.numeric(st_length(geometry))) %>%
+  st_drop_geometry() %>%
+  group_by(station_id, highway) %>%
+  summarise(road_len_m = sum(len_m, na.rm = TRUE), .groups = "drop")
+
+# Pivot wide + total density (m per km^2)
+buf_area_km2 <- as.numeric(set_units(pi * (buf_rd_m^2), m^2) %>% set_units(km^2))
+road_len_wide <- pivot_wider(
+  road_len_by_class,
+  id_cols    = station_id,
+  names_from = highway,
+  values_from = road_len_m,
+  values_fill = 0
+) %>%
+  mutate(
+    road_len_total_m       = rowSums(across(where(is.numeric))),
+    road_density_m_per_km2 = road_len_total_m / buf_area_km2
+  ) %>%
+  rename(Id = station_id)
+
+# ---- (2) OSM PLACES: distance to nearest city/town center ----
+places <- opq(bbox = bbox_large) %>%
+  add_osm_feature(key = "place", value = c("city","town")) %>%
+  osmdata_sf()
+
+cities_pts  <- places$osm_points
+cities_poly <- places$osm_multipolygons
+cities_list <- list()
+
+if (!is.null(cities_pts)  && nrow(cities_pts)  > 0) cities_list[[length(cities_list)+1]] <- st_transform(cities_pts,  4326) %>% select(name, place, geometry)
+if (!is.null(cities_poly) && nrow(cities_poly) > 0) {
+  cent <- st_point_on_surface(st_transform(cities_poly, 4326))
+  cities_list[[length(cities_list)+1]] <- cent %>% select(name, place, geometry)
+}
+stopifnot(length(cities_list) > 0)
+cities_all <- do.call(rbind, cities_list)
+
+dist_mat <- st_distance(stations_sf, cities_all)   # meters
+nearest_city_km <- apply(dist_mat, 1, function(v) {
+  v <- as.numeric(v)
+  if (all(!is.finite(v))) NA_real_ else min(v, na.rm = TRUE) / 1000
+})
+
+# ---- (3) Assemble station-level features ----
+stations_features <- stations %>%
+  mutate(nearest_road_class = nearest_class,
+         dist_to_city_km    = nearest_city_km) %>%
+  left_join(road_len_wide, by = "Id")
+
+# If you also have population from your earlier step:
+# stations_features <- stations_features %>%
+#   left_join(stations_pop %>% select(Id, pop_density_mean_1km), by = "Id")
+
+# ---- (4) Join onto station_day ----
+station_day <- station_day %>%
+  left_join(stations_features, by = "Id")
+```
+
+```{r}
+
+# --- 1) Coalesce duplicated coords & build clean feature table ---
+df <- station_day %>%
+  mutate(
+    lon_final = coalesce(lon, lon.x, lon.y),
+    lat_final = coalesce(lat, lat.x, lat.y),
+    dow   = factor(dow),             # ensure factor
+    month = factor(month),
+    CH_SPEED = factor(CH_SPEED),
+    CH_TYPE  = factor(CH_TYPE),
+    CON_TYPE = factor(CON_TYPE),
+    CP_CHARGE = factor(CP_CHARGE),
+    USAGE_    = factor(USAGE_),
+    nearest_road_class = factor(nearest_road_class),
+    log_energy = log1p(energy_per_day_kWh)
+  ) %>%
+  # keep the predictors we want
+  select(
+    Id, date,
+    log_energy,
+    # temporal
+    dow, month, year, week, is_weekend,
+    # lags/rolls (very predictive)
+    sessions_lag_1d, sessions_lag_7d, sessions_roll7,
+    energy_lag_1d,   energy_lag_7d,   energy_roll7,
+    # static charger meta
+    CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_,
+    OUTPUT1_kW, OUTPUT2_kW,
+    # spatial
+    lon_final, lat_final, nearest_station_dist_km, dist_to_city_km,
+    pop_density_mean_1km,
+    road_density_m_per_km2, road_len_total_m,
+    nearest_road_class,
+    # optional: per-class road lengths (will be numeric)
+    motorway, motorway_link, trunk, primary, secondary,
+    tertiary, residential, service, unclassified
+  ) %>%
+  # make logical usable
+  mutate(is_weekend = as.integer(is_weekend)) %>%
+  # drop rows with any missing predictors/target
+  drop_na()
+
+# --- 2) Design matrix (one-hot for factors; no intercept) ---
+X <- model.matrix(
+  log_energy ~ . - Id - date - 1,  # keep Id/date out of predictors
+  data = df
+)
+y <- df$log_energy
+
+# --- 3) Time-based split (use your cutoff) ---
+cutoff <- as.Date("2019-07-01")
+if (!any(df$date < cutoff) || !any(df$date >= cutoff)) {
+  # fallback: 80/20 split by time if that date leaves one side empty
+  udates <- sort(unique(df$date))
+  cutoff <- udates[floor(length(udates) * 0.8)]
+}
+train_idx <- which(df$date < cutoff)
+
+dtrain <- xgb.DMatrix(data = X[train_idx, , drop = FALSE], label = y[train_idx])
+dtest  <- xgb.DMatrix(data = X[-train_idx, , drop = FALSE], label = y[-train_idx])
+
+# --- 4) Train xgboost baseline ---
+params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+bst <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 600,
+  watchlist = list(train = dtrain, eval = dtest),
+  early_stopping_rounds = 30,
+  print_every_n = 20
+)
+
+# --- 5) Predict & evaluate on test set (back-transform to kWh) ---
+pred_log <- predict(bst, dtest)
+pred_kWh <- expm1(pred_log)
+true_kWh <- expm1(y[-train_idx])
+
+rmse <- sqrt(mean((pred_kWh - true_kWh)^2))
+mae  <- mean(abs(pred_kWh - true_kWh))
+cat("Cutoff:", as.character(cutoff),
+    "\nRMSE:", round(rmse, 2), "kWh   MAE:", round(mae, 2), "kWh\n")
+
+# --- 6) Feature importance (top 20) ---
+print(utils::head(xgb.importance(model = bst), 20))
+```
+
+Total overfitted i guuess. need to clean this crazy stuff.
