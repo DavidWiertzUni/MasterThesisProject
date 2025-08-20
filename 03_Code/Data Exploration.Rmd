@@ -10,6 +10,9 @@ library(ggplot2)
 library(tidyr)
 library(leaflet)
 library(sf)
+library(recipes)  
+library(stringr)
+library(slider) 
 ```
 
 ```{r}
@@ -104,15 +107,6 @@ leaflet(data = most_used_stations_latlon) %>%
 ```
 
 ```{r}
-top10 <- usage_count %>% head(10)
-ggplot(top10, aes(x = reorder(as.factor(Id), num_sessions), y = num_sessions)) +
-  geom_bar(stat = "identity", fill = "skyblue") +
-  coord_flip() +
-  labs(title = "Top 10 Most Used Charging Stations", x = "Charging Point ID", y = "Number of Sessions") +
-  theme_minimal()
-```
-
-```{r}
 library(lubridate)
 charging_session_raw <- charging_session_raw %>%
   mutate(StartMonth = month(`Start Date`, label = TRUE))
@@ -165,9 +159,11 @@ charging_session_raw %>%
     theme_minimal()
 ```
 
+Graph unfiltered.
+
 ```{r}
 charging_session_raw %>%
-  #filter(duration_minutes > 0, `Total kWh` > 0, `Total kWh`< 100) %>%
+ # filter(duration_minutes > 0, `Total kWh` > 0, `Total kWh`< 100) %>%
   ggplot(aes(x = `Total kWh`)) +
     geom_histogram(binwidth = 5, fill = "skyblue", color = "white")  + scale_x_continuous(
       breaks = seq(0, 300, 5)
@@ -181,9 +177,6 @@ charging_session_raw %>%
 
 -\> I need to filter the sessions with \<0min; \> 1440 min (1 Day); kwh \< 0kWh; These sessions are most probably faulty.
 
-```{}
-```
-
 -\> I need to filter the sessions with \<0min; \> 1440 min (1 Day); kwh \< 0kWh; These sessions are most probably faulty.
 
 ```{r}
@@ -196,13 +189,46 @@ charging_sessions_filtered <- charging_session_raw %>%
   filter(
     duration_minutes >= 0,       # remove negative durations
     duration_minutes <= 1440,    # remove sessions longer than 1 day
-    `Total kWh` > 0                      # remove sessions with negative or zero kWh
+    `Total kWh` > 0 ,
+    `Total kWh` < 150
+    # remove sessions with negative or zero kWh
   )
 
 # Save to Processed folder
 write_csv(charging_sessions_filtered, "../02_Processed_Data/charging_sessions_filtered.csv")
 ```
 
+Graph with the filtered Data for comparison
+
+```{r}
+
+charging_sessions_filtered %>%
+  ggplot(aes(x = `Total kWh`)) +
+    geom_histogram(binwidth = 5, fill = "skyblue", color = "white")  + scale_x_continuous(
+      breaks = seq(0,300, 5)
+    ) +
+    labs(
+      title = "Distribution of Delivered Charging Energy",
+      x = "Energy delivered (kWh)",
+      y = "Number of Sessions"
+    ) + theme_minimal()
+
+charging_sessions_filtered %>%
+  ggplot(aes(x = duration_minutes)) +
+    geom_histogram(binwidth = 0.1, fill = "skyblue", color = "white") +
+    scale_x_log10(
+      breaks = c(1, 2, 5, 10, 20, 30, 60, 120, 240, 480, 1000),
+      labels = c("1", "2", "5", "10", "20", "30", "60", "120", "240", "480", "1000")
+  )+
+    labs(
+      title = "Distribution of Charging Session Durations (Log Scale)",
+      x = "Duration (minutes, log10 scale)",
+      y = "Number of Sessions"
+    ) +
+    theme_minimal()
+```
+
+\
 Top 10 Charging Station Boxplot; Brauche ich vermutlich nicht.
 
 ```{r}
@@ -231,7 +257,417 @@ ggplot(filtered_data, aes(x = as.factor(Id), y = duration_minutes)) +
 Feature Engineering:
 
 1.  Time based & Location features already in the dataset;
+    1.  Avg power zum Dataset hinzufügen
 2.  Mapping of shortest distance to the next station;
 3.  Mapping of nearest Street classification (Bundesstraße, Landstraße...)
 4.  mapping of nearest point of interest & the classification of it;
     1.  Supermarket; Highway station;
+
+```{r}
+charging_sessions_filtered <- charging_sessions_filtered %>%
+  mutate(
+    avg_power_kW   =  `Total kWh`  / duration_hours  
+  )
+```
+
+```{r}
+colnames(charging_sessions_filtered)
+colnames(charging_points_raw)
+
+```
+
+Bullshit ML Table:
+
+```{r}
+dir_out <- "../02_Processed_Data"
+if (!dir.exists(dir_out)) dir.create(dir_out, recursive = TRUE)
+
+# ----------------------------
+# 1) Session-level cleanup & core features
+# ----------------------------
+sessions <- charging_sessions_filtered %>%
+  # make sure duration fields exist & are clean
+  mutate(
+    StartDateTime = if (!"StartDateTime" %in% names(.))
+      ymd_hms(paste(`Start Date`, `Start Time`)) else StartDateTime,
+    EndDateTime   = if (!"EndDateTime" %in% names(.))
+      ymd_hms(paste(`End Date`, `End Time`)) else EndDateTime,
+    duration_minutes = if (!"duration_minutes" %in% names(.))
+      as.numeric(difftime(EndDateTime, StartDateTime, units = "mins")) else duration_minutes,
+    duration_hours   = duration_minutes / 60,
+    avg_power_kW     = if ("Total kWh" %in% names(.))
+                         `Total kWh` / pmax(duration_hours, 1e-9) else NA_real_
+  ) %>%
+  # keep plausible sessions (belt-and-suspenders even if done before)
+  filter(duration_minutes > 0, duration_minutes <= 1440) %>%
+  { if ("Total kWh" %in% names(.)) filter(., `Total kWh` > 0) else . } %>%
+  # temporal features
+  mutate(
+    hour_of_day = hour(StartDateTime),
+    day_of_week = wday(StartDateTime, label = TRUE, week_start = 1),  # Mon..Sun
+    is_weekend  = day_of_week %in% c("Sat", "Sun"),
+    month       = month(StartDateTime, label = TRUE),
+    quarter     = quarter(StartDateTime),
+    season      = case_when(
+      month(StartDateTime) %in%  c(12,1,2)  ~ "Winter",
+      month(StartDateTime) %in%  c(3,4,5)   ~ "Spring",
+      month(StartDateTime) %in%  c(6,7,8)   ~ "Summer",
+      TRUE                                ~ "Autumn"
+    )
+  )
+
+# ----------------------------
+# 2) Join station metadata
+# ----------------------------
+sessions_full <- sessions %>%
+  left_join(charging_points_raw, by = "Id")
+
+# ----------------------------
+# 3) Coordinates -> lon/lat (if needed)
+#    Set crs_input to your source CRS.
+#    If your x/y are already lon/lat, set crs_input <- 4326.
+# ----------------------------
+crs_input <- 27700  # set to 4326 if x/y already lon/lat
+
+# 0) Add a stable join key FIRST
+sessions_full <- sessions_full %>%
+  mutate(row_id___ = row_number())
+
+if (all(c("x","y") %in% names(sessions_full))) {
+
+  # 1) Subset rows with coords present, coerce to numeric
+  sf_pts <- sessions_full %>%
+    filter(!is.na(x) & !is.na(y)) %>%
+    mutate(
+      x = suppressWarnings(as.numeric(x)),
+      y = suppressWarnings(as.numeric(y))
+    )
+
+  # 2) If coords are already lon/lat (4326), just copy; else transform
+  if (crs_input == 4326) {
+    sf_pts_xy <- sf_pts %>%
+      transmute(row_id___, lon = x, lat = y)
+  } else {
+    sf_pts_wgs <- sf_pts %>%
+      st_as_sf(coords = c("x","y"), crs = crs_input, remove = TRUE) %>%
+      st_transform(4326)
+
+    coords <- st_coordinates(sf_pts_wgs)
+    sf_pts_xy <- sf_pts_wgs %>%
+      st_drop_geometry() %>%
+      mutate(lon = coords[,1], lat = coords[,2]) %>%
+      select(row_id___, lon, lat)
+  }
+
+  # 3) Join lon/lat back to ALL rows (rows without coords remain NA)
+  sessions_full <- sessions_full %>%
+    left_join(sf_pts_xy, by = "row_id___") %>%
+    select(-row_id___)
+}
+
+# ----------------------------
+# 4) Aggregates useful for modeling (utilization)
+#    Example: sessions/day per station
+# ----------------------------
+sessions_full <- sessions_full %>%
+  mutate(date = as_date(StartDateTime)) %>%
+  group_by(Id, date) %>%
+  mutate(
+    sessions_per_station_day = n(),
+    energy_per_station_day_kWh = if ("Total kWh" %in% names(.))
+                                   sum(`Total kWh`, na.rm = TRUE) else NA_real_
+  ) %>%
+  ungroup()
+
+# ----------------------------
+# 5) Keep a clean set of features for ML
+# ----------------------------
+# Choose features: (adjust to your needs)
+feat_cols <- c(
+  # IDs / keys
+  "Id", "Connector", "Site", "Model",
+  # target ideas (pick one later)
+  "duration_minutes", "duration_hours", "avg_power_kW", "Total kWh",
+  # temporal
+  "hour_of_day", "day_of_week", "is_weekend", "month", "quarter", "season",
+  # charger meta
+  "CH_SPEED", "CH_TYPE", "CON_TYPE", "CP_CHARGE", "USAGE_", "OUTPUT1_kW", "OUTPUT2_kW",
+  # geo
+  "lon", "lat",
+  # aggregates
+  "sessions_per_station_day", "energy_per_station_day_kWh"
+)
+
+# Keep only columns that exist
+feat_cols <- intersect(feat_cols, names(sessions_full))
+data_for_ml <- sessions_full %>% select(all_of(feat_cols))
+
+# ----------------------------
+# 6) One-hot encode categoricals & create model matrix
+# ----------------------------
+# Identify outcome later; here we just build an encoded feature table.
+rec <- recipe(~ ., data = data_for_ml) %>%
+  # (optional) keep IDs out of predictors
+  update_role(Id, new_role = "id") %>%
+  # make logicals numeric to avoid single-level factor issues
+  step_mutate(is_weekend = as.integer(is_weekend)) %>%
+  # drop zero-variance BEFORE dummies
+  step_zv(all_predictors()) %>%
+  # one-hot encode remaining categoricals
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  # normalize numerics
+  step_normalize(all_numeric_predictors())
+
+pp <- prep(rec, training = data_for_ml, verbose = FALSE)
+ml_matrix <- bake(pp, new_data = data_for_ml)
+
+# ----------------------------
+# 7) Save outputs
+# ----------------------------
+write_csv(sessions_full, file.path(dir_out, "sessions_enriched.csv"))
+write_csv(ml_matrix,    file.path(dir_out, "sessions_ml_matrix.csv"))
+
+# (Optional) also save the processing recipe to reapply at inference time
+saveRDS(pp, file.path(dir_out, "preprocess_recipe.rds"))
+```
+
+Correct Joined ML Ready Table:\
+
+```{r}
+ir_out <- "../02_Processed_Data"
+if (!dir.exists(dir_out)) dir.create(dir_out, recursive = TRUE)
+
+
+parse_dt <- function(date_chr, time_chr) {
+  x <- str_squish(paste0(date_chr, " ", time_chr))
+  parse_date_time(x, orders = c("Y-m-d H:M:S", "Y-m-d H:M"), tz = "UTC", exact = FALSE)
+}
+
+charging_sessions_filtered <- charging_session_raw %>%
+  mutate(
+    StartDateTime = parse_dt(`Start Date`, `Start Time`),
+    EndDateTime   = parse_dt(`End Date`,   `End Time`)
+  ) %>%
+  filter(!is.na(StartDateTime), !is.na(EndDateTime)) %>%
+  mutate(
+    duration_minutes = as.numeric(difftime(EndDateTime, StartDateTime, units = "mins")),
+    duration_hours   = duration_minutes / 60
+  ) %>%
+  
+  filter(duration_minutes > 0, duration_minutes <= 1440, `Total kWh` > 0, `Total kWh` <=100) %>%
+  mutate(avg_power_kW = `Total kWh` / pmax(duration_hours, 1e-9))
+
+write_csv(charging_sessions_filtered, file.path(dir_out, "charging_sessions_filtered.csv"))
+
+#### ====== 2) STATION GEO: x/y -> lon/lat (set CRS HERE) ======
+crs_input <- 27700        # <-- CHANGE to 4326 if x/y already lon/lat
+
+cp_sf <- st_as_sf(charging_points_raw, coords = c("x","y"), crs = crs_input, remove = FALSE)
+cp_ll <- st_transform(cp_sf, 4326)
+coords <- st_coordinates(cp_ll)
+
+charging_points_geo <- charging_points_raw %>%
+  mutate(lon = coords[,1], lat = coords[,2])
+
+sessions_full <- charging_sessions_filtered %>%
+  left_join(
+    charging_points_geo %>%
+      select(Id, CP_Name, CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_,
+             OUTPUT1_kW, OUTPUT2_kW, lon, lat),
+    by = "Id"
+  )
+
+write_csv(sessions_full, file.path(dir_out, "sessions_enriched.csv"))
+
+
+station_day <- sessions_full %>%
+  mutate(date = as_date(StartDateTime)) %>%
+  group_by(Id, date) %>%
+  summarise(
+    sessions_per_day   = n(),
+    energy_per_day_kWh = sum(`Total kWh`, na.rm = TRUE),
+    avg_duration_min   = mean(duration_minutes, na.rm = TRUE),
+    avg_power_kW_day   = mean(avg_power_kW, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    dow        = wday(date, label = TRUE, week_start = 1),
+    is_weekend = dow %in% c("Sat","Sun"),
+    month      = month(date, label = TRUE),
+    year       = year(date),
+    week       = isoweek(date)
+  ) %>%
+  arrange(Id, date) %>%
+  group_by(Id) %>%
+  mutate(
+    sessions_lag_1d = lag(sessions_per_day, 1),
+    sessions_lag_7d = lag(sessions_per_day, 7),
+    energy_lag_1d   = lag(energy_per_day_kWh, 1),
+    energy_lag_7d   = lag(energy_per_day_kWh, 7),
+    sessions_roll7  = slide_dbl(sessions_per_day, mean, .before = 7, .complete = TRUE),
+    energy_roll7    = slide_dbl(energy_per_day_kWh, mean, .before = 7, .complete = TRUE)
+  ) %>%
+  ungroup() %>%
+  # add static station meta once (if you want them at daily level too)
+  left_join(
+    charging_points_geo %>%
+      select(Id, CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_, OUTPUT1_kW, OUTPUT2_kW, lon, lat),
+    by = "Id"
+  )
+
+write_csv(station_day, file.path(dir_out, "station_day_enriched.csv"))
+
+
+station_day_model <- station_day %>%
+  filter(
+    !is.na(sessions_lag_1d), !is.na(energy_lag_1d),
+    !is.na(sessions_roll7),  !is.na(energy_roll7)
+  )
+
+write_csv(station_day_model, file.path(dir_out, "station_day_modelable.csv"))
+
+
+data_for_ml <- station_day_model %>%
+  select(
+    Id, date,
+    sessions_per_day, energy_per_day_kWh,
+    dow, is_weekend, month, year, week,
+    sessions_lag_1d, sessions_lag_7d, sessions_roll7,
+    energy_lag_1d, energy_lag_7d, energy_roll7,
+    CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_,
+    OUTPUT1_kW, OUTPUT2_kW, lon, lat
+  )
+
+rec <- recipe(~ ., data = data_for_ml) %>%
+  update_role(Id, date, new_role = "id") %>%
+  step_mutate(is_weekend = as.factor(is_weekend)) %>%
+  step_unknown(all_nominal_predictors(), new_level = "UNK") %>%  # safely handle NA factors
+  step_zv(all_predictors()) %>%                                  # drop single‑level cols BEFORE dummies
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_normalize(all_numeric_predictors())
+
+pp <- prep(rec, training = data_for_ml, verbose = FALSE)
+ml_matrix <- bake(pp, new_data = data_for_ml)
+
+write_csv(ml_matrix, file.path(dir_out, "station_day_ml_matrix.csv"))
+saveRDS(pp,        file.path(dir_out, "station_day_preprocess_recipe.rds"))
+
+cat("✅ Done.\n",
+    "sessions_filtered:", nrow(charging_sessions_filtered), "rows\n",
+    "sessions_enriched:", nrow(sessions_full), "rows\n",
+    "station_day:", nrow(station_day), "rows\n",
+    "station_day_modelable:", nrow(station_day_model), "rows\n",
+    "ML matrix:", nrow(ml_matrix), "x", ncol(ml_matrix), "\n")
+```
+
+Adding shortest distance
+
+```{r}
+# ==== packages ====
+library(dplyr)
+library(sf)
+library(osmdata)
+library(dodgr)
+
+# ==== input: stations with lon/lat (WGS84) ====
+# Use your table that holds one row per station and lon/lat, e.g. charging_points_geo
+stations <- charging_points_geo %>%
+  filter(!is.na(lon), !is.na(lat)) %>%
+  distinct(Id, lon, lat)
+
+stations_sf <- st_as_sf(stations, coords = c("lon", "lat"), crs = 4326)
+
+# ==== build a buffered bbox around stations (to ensure roads cover all points) ====
+# buffer 10 km (in meters) in a projected CRS then back to WGS84
+bb_poly <- stations_sf %>%
+  st_union() %>%
+  st_transform(3857) %>%              # Web Mercator in meters
+  st_buffer(10000) %>%                # 10 km buffer
+  st_transform(4326)
+bb <- st_bbox(bb_poly)
+
+hw_keep <- c(
+  "motorway","motorway_link",
+  "trunk","trunk_link",
+  "primary","primary_link",
+  "secondary","secondary_link",
+  "tertiary","tertiary_link",
+  "unclassified","residential","living_street","service"
+)
+
+q <- opq(bbox = bb) %>% add_osm_feature(key = "highway", value = hw_keep)
+net <- osmdata_sf(q)
+
+roads <- net$osm_lines
+if (is.null(roads) || nrow(roads) == 0) {
+  stop("No OSM road lines were returned for the area. Try increasing the buffer distance.")
+}
+
+# drop any stragglers that slipped through (construction/proposed/disused)
+bad <- c("construction","proposed","disused")
+if ("highway" %in% names(roads)) {
+  roads <- roads[!(roads$highway %in% bad), ]
+}
+
+# ==== build a drivable graph & keep the giant component ====
+graph <- weight_streetnet(roads, wt_profile = "motorcar")
+graph <- dodgr_contract_graph(graph)
+
+# Keep only the largest connected component so everything is routable
+comp <- dodgr_components(graph)
+largest <- which.max(comp$csize)
+graph <- graph[graph$component == largest, ]
+
+# ==== map stations onto the graph vertices ====
+coords <- st_coordinates(stations_sf)
+v_ids <- match_pts_to_graph(graph, coords)  # returns vertex ids (or NA if too far)
+
+# Fallback: any NA still? try snapping to nearest edge vertices by expanding search
+if (any(is.na(v_ids))) {
+  # crude fallback: use nearest graph vertex by kd-tree (fast)
+  verts <- dodgr_vertices(graph)
+  nn <- FNN::get.knnx(verts[, c("x","y")], coords, k = 1)$nn.index
+  v_ids[is.na(v_ids)] <- verts$id[nn[is.na(v_ids)]]
+  # if FNN not available, you could use a slower spatial join instead.
+}
+
+# If still NA (very unlikely now): mark for geodesic fallback
+unmatched <- which(is.na(v_ids))
+
+# ==== compute pairwise road distances (meters) ====
+dmat_m <- dodgr_dists(graph, from = v_ids, to = v_ids)
+
+# ==== nearest other station by road distance ====
+nearest_m <- apply(dmat_m, 1, function(v) {
+  vpos <- v[is.finite(v) & v > 0]
+  if (length(vpos)) min(vpos) else NA_real_
+})
+
+nn_df <- tibble(
+  Id = stations$Id,
+  nearest_station_dist_km = as.numeric(nearest_m) / 1000
+)
+
+# ==== fallback for any NA distances: use geodesic distance ====
+if (any(is.na(nn_df$nearest_station_dist_km))) {
+  # compute straight-line distances and fill only NAs
+  dist_geo <- st_distance(stations_sf, stations_sf) # meters, diagonal zero
+  nearest_geo_m <- apply(dist_geo, 1, function(v) {
+    vpos <- as.numeric(v)
+    vpos <- vpos[vpos > 0 & is.finite(vpos)]
+    if (length(vpos)) min(vpos) else NA_real_
+  })
+  fill_idx <- which(is.na(nn_df$nearest_station_dist_km))
+  nn_df$nearest_station_dist_km[fill_idx] <- nearest_geo_m[fill_idx] / 1000
+}
+
+# ==== join back to your daily table ====
+station_day <- station_day %>%
+  left_join(nn_df, by = "Id")
+
+# quick sanity check
+summary(station_day$nearest_station_dist_km)
+
+
+
+```
