@@ -434,7 +434,7 @@ saveRDS(pp, file.path(dir_out, "preprocess_recipe.rds"))
 Correct Joined ML Ready Table:\
 
 ```{r}
-ir_out <- "../02_Processed_Data"
+dir_out <- "../02_Processed_Data"
 if (!dir.exists(dir_out)) dir.create(dir_out, recursive = TRUE)
 
 
