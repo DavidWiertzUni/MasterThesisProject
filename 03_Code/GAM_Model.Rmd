@@ -1,0 +1,310 @@
+---
+title: "Models"
+output: html_document
+---
+
+First import the libarys and the data.
+
+```{r}
+library(mgcv)
+library(dplyr)
+library(lubridate)
+library(mgcv)
+library(ggplot2)
+library(tidyr)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(leaflet)
+library(sf)
+library(recipes)  
+library(stringr)
+library(slider) 
+```
+
+```{r}
+
+station_day_rdy<- read_csv("../02_Processed_data/station_day_rdy.csv")
+colnames(station_day_rdy)
+```
+
+```{r}
+mean(df$energy_per_day_kWh, na.rm = TRUE)
+```
+
+GAM Model:
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(mgcv)
+library(ggplot2)
+
+# Assume your data frame is called `df`
+# 0) Column hygiene: pick a single lon/lat, factorize, light feature selection
+df <- station_day_rdy %>%
+  mutate(
+    date = as.Date(date),
+    lon = coalesce(lon.x, lon.y, lon.x.x, lon.y.y, lon.x.x.x, lon.y.y.y),
+    lat = coalesce(lat.x, lat.y, lat.x.x, lat.y.y, lat.x.x.x, lat.y.y.y),
+    across(c(dow, month, CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_,
+             nearest_road_class.x, nearest_road_class.y), as.factor),
+    Id = as.factor(Id),
+    doy = lubridate::yday(date),
+    pop1 = pop_density_mean_1km,
+    pop10 = pop_density_mean_10km,
+    pop50 = pop_density_mean_50km
+  ) %>%
+  # ⚠️ notice: no is_weekend column anymore
+  select(
+    energy_per_day_kWh, sessions_per_day, avg_duration_min, avg_power_kW_day,
+    OUTPUT1_kW, OUTPUT2_kW, nearest_station_dist_km,
+    pop1, pop10, pop50, lon, lat, doy, date, Id,
+    dow, month, CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_
+  ) %>%
+  filter(!is.na(energy_per_day_kWh), !is.na(lon), !is.na(lat), !is.na(doy)) %>%
+  arrange(date)
+
+# 1) Time-aware split (80/20 by date, no extra packages)
+n <- nrow(df)
+cut_idx <- floor(0.8 * n)
+train <- df[1:cut_idx, ]
+test  <- df[(cut_idx + 1):n, ]
+
+# 2) Fit GAM
+# cyclic day-of-year smooth needs explicit knots
+kn <- list(doy = c(0.5, 366.5))
+fac_cols <- names(Filter(is.factor, train))
+ok_factors  <- fac_cols[sapply(train[fac_cols], function(x) nlevels(droplevels(x)) >= 2)]
+bad_factors <- setdiff(fac_cols, ok_factors)
+
+if (length(bad_factors)) {
+  message("Dropping factors with <2 levels in training: ",
+          paste(bad_factors, collapse = ", "))
+}
+
+## ---  B) Make sure TEST uses the same levels as TRAIN (avoids NA in model.matrix)
+for (cn in fac_cols) {
+  train[[cn]] <- droplevels(train[[cn]])
+  test[[cn]]  <- factor(test[[cn]], levels = levels(train[[cn]]))
+}
+
+## ---  C) Build the GAM formula dynamically (exclude 1-level factors)
+# Which factor terms are *intended* to be parametric?
+intended_factor_terms <- c("dow","month",
+                           "CH_SPEED","CH_TYPE","CON_TYPE","CP_CHARGE","USAGE_")
+
+factor_terms_to_use <- intersect(ok_factors, intended_factor_terms)
+
+base_terms <- c(
+  's(doy, bs = "cc", k = 20)',
+  's(sessions_per_day, k = 10)',
+  's(avg_duration_min,   k = 10)',
+  's(avg_power_kW_day,   k = 10)',
+   # 'OUTPUT1_kW + OUTPUT2_kW',
+  's(nearest_station_dist_km, k = 10)',
+  's(pop1,  k = 10)', 's(pop10, k = 10)', 's(pop50, k = 10)',
+ # 'te(lon, lat, k = c(30, 30))',
+  's(Id, bs = "re")'
+)
+
+rhs <- paste(c(base_terms, factor_terms_to_use), collapse = " + ")
+form <- as.formula(paste("energy_per_day_kWh ~", rhs))
+
+## ---  D) Refit with the safe formula
+kn <- list(doy = c(0.5, 366.5))
+gam_fit <- mgcv::gam(
+  formula = form,
+  data = train,
+  family = gaussian(),
+  method = "REML",
+  select = TRUE,
+  knots = kn,
+  na.action = na.exclude
+)
+
+summary(gam_fit)
+cat("\n=== Model summary ===\n")
+print(summary(gam_fit))
+
+# 3) Diagnostics with mgcv (no gratia)
+cat("\n=== gam.check ===\n")
+gam.check(gam_fit)       
+
+cat("\n=== Concurvity (lower is better) ===\n")
+concurvity(gam_fit, full = TRUE)
+
+# 4) Predict + manual metrics
+test$pred <- as.numeric(predict(gam_fit, newdata = test, type = "response"))
+
+rmse <- sqrt(mean((test$energy_per_day_kWh - test$pred)^2, na.rm = TRUE))
+mae  <- mean(abs(test$energy_per_day_kWh - test$pred), na.rm = TRUE)
+r2   <- cor(test$energy_per_day_kWh, test$pred, use = "complete.obs")^2
+
+cat("\n=== Test metrics ===\n")
+print(c(RMSE = rmse, MAE = mae, R2 = r2))
+
+
+# Predicted vs actual
+ggplot(test, aes(x = energy_per_day_kWh, y = pred)) +
+  geom_point(alpha = 0.35) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  labs(x = "Actual kWh/day", y = "Predicted kWh/day",
+       title = "GAM predictions vs. actual") +
+  theme_minimal()
+
+# Residuals vs fitted (base)
+res <- residuals(gam_fit, type = "pearson")
+fit <- fitted(gam_fit)
+plot(fit, res, xlab = "Fitted", ylab = "Pearson residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, lty = 2)
+
+# QQ-plot of residuals (base)
+qqnorm(res, main = "QQ-plot of residuals"); qqline(res)
+
+# Partial effect shapes (base plot.gam panels)
+# pages=1 puts all smooths into a single page; adjust if many terms
+par(mfrow = c(2, 2))
+plot(gam_fit, pages = 1, scheme = 1, scale = 0, shade = TRUE)
+
+
+```
+
+ggplot(test, aes(x = energy_per_day_kWh, y = pred)) +
+
+geom_point(alpha = 0.35) +
+
+geom_abline(slope = 1, intercept = 0, linetype = 2) +
+
+labs(x = "Actual kWh/day", y = "Predicted kWh/day",
+
+title = "GAM predictions vs. actual") +
+
+theme_minimal()
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(mgcv)
+library(ggplot2)
+
+# ===== 0) Datenaufbereitung
+df <- station_day_rdy %>%
+  mutate(
+    date = as.Date(date),
+    lon  = coalesce(lon.x, lon.y, lon.x.x, lon.y.y, lon.x.x.x, lon.y.y.y),
+    lat  = coalesce(lat.x, lat.y, lat.x.x, lat.y.y, lat.x.x.x, lat.y.y.y),
+    across(c(dow, month, CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_,
+             nearest_road_class.x, nearest_road_class.y), as.factor),
+    Id  = as.factor(Id),
+    doy = yday(date),
+    pop1  = pop_density_mean_1km,
+    pop10 = pop_density_mean_10km,
+    pop50 = pop_density_mean_50km
+  ) %>%
+  select(
+    energy_per_day_kWh, sessions_per_day, avg_duration_min, avg_power_kW_day,
+    pop1, pop10, pop50, lon, lat, doy, date, Id,
+    dow, month, CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_
+  ) %>%
+  filter(!is.na(energy_per_day_kWh), !is.na(lon), !is.na(lat), !is.na(doy)) %>%
+  arrange(date)
+
+# ===== 1) Zeitlicher Split 80/20
+n <- nrow(df)
+cut_idx <- floor(0.8 * n)
+train <- df[1:cut_idx, ]
+test  <- df[(cut_idx + 1):n, ]
+
+# ===== 2) Faktoren mit nur 1 Stufe droppen + Levels angleichen
+fac_cols    <- names(Filter(is.factor, train))
+ok_factors  <- fac_cols[sapply(train[fac_cols], function(x) nlevels(droplevels(x)) >= 2)]
+bad_factors <- setdiff(fac_cols, ok_factors)
+if (length(bad_factors)) {
+  message("Dropping factors with <2 levels in training: ", paste(bad_factors, collapse = ", "))
+}
+for (cn in fac_cols) {
+  train[[cn]] <- droplevels(train[[cn]])
+  test[[cn]]  <- factor(test[[cn]], levels = levels(train[[cn]]))
+}
+
+
+
+# ===== 4) Räumlichen Smooth nur nehmen, wenn genug Vielfalt in lon/lat
+enough_spatial <- (length(unique(train$lon)) > 50 && length(unique(train$lat)) > 50)
+spatial_term <- if (enough_spatial) 'te(lon, lat, bs = c("tp","tp"), k = c(20,20))' else NULL
+
+# ===== 5) Modellformel zusammenbauen
+# beabsichtigte kategoriale Terme (ohne is_weekend)
+intended_factor_terms <- c("dow","month","CH_SPEED","CH_TYPE","CON_TYPE","CP_CHARGE","USAGE_")
+
+factor_terms_to_use <- intersect(ok_factors, intended_factor_terms)
+
+
+# Basis-Terme:
+# - k erhöht bei avg_duration_min (war in gam.check knapp)
+# - schwache Smooths entfernt: nearest_station_dist_km, pop1
+base_terms <- c(
+  's(doy, bs = "cc", k = 20)',
+  's(sessions_per_day, bs = "ts", k = 12)',
+  's(avg_duration_min,   bs = "ts", k = 15)',
+  's(avg_power_kW_day,   bs = "ts", k = 12)',
+ # output_terms,
+  # entferne s(nearest_station_dist_km) und s(pop1)
+  's(pop10, bs = "ts", k = 5)',
+  's(pop50, bs = "ts", k = 6)',
+  if (!is.null(spatial_term)) spatial_term,
+  's(Id, bs = "re")'
+)
+
+rhs  <- paste(c(base_terms, factor_terms_to_use), collapse = " + ")
+form <- as.formula(paste("energy_per_day_kWh ~", rhs))
+
+# ===== 6) Fit
+kn <- list(doy = c(0.5, 366.5))
+gam_fit <- mgcv::gam(
+  formula = form,
+  data    = train,
+  family  = gaussian(),
+  method  = "REML",
+  select  = TRUE,   # ganze Terme können gegen 0 geschrumpft werden
+  knots   = kn,
+  na.action = na.exclude
+)
+
+cat("\n=== Model summary ===\n"); print(summary(gam_fit))
+
+# ===== 7) Diagnostics
+cat("\n=== gam.check ===\n"); gam.check(gam_fit)
+
+cat("\n=== Concurvity (lower is better) ===\n")
+print(concurvity(gam_fit, full = TRUE))
+
+# ===== 8) Test-Performance
+test$pred <- as.numeric(predict(gam_fit, newdata = test, type = "response"))
+rmse <- sqrt(mean((test$energy_per_day_kWh - test$pred)^2, na.rm = TRUE))
+mae  <- mean(abs(test$energy_per_day_kWh - test$pred), na.rm = TRUE)
+r2   <- cor(test$energy_per_day_kWh, test$pred, use = "complete.obs")^2
+cat("\n=== Test metrics ===\n"); print(c(RMSE = rmse, MAE = mae, R2 = r2))
+
+# ===== 9) Plots
+ggplot(test, aes(x = energy_per_day_kWh, y = pred)) +
+  geom_point(alpha = 0.35) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  labs(x = "Actual kWh/day", y = "Predicted kWh/day",
+       title = "GAM predictions vs. actual") +
+  theme_minimal()
+
+res <- residuals(gam_fit, type = "pearson")
+fit <- fitted(gam_fit)
+plot(fit, res, xlab = "Fitted", ylab = "Pearson residuals", main = "Residuals vs Fitted")
+abline(h = 0, lty = 2)
+
+qqnorm(res, main = "QQ-plot of residuals"); qqline(res)
+
+par(mfrow = c(2, 2))
+plot(gam_fit, pages = 1, scheme = 1, scale = 0, shade = TRUE)
+
+```

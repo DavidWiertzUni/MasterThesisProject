@@ -33,16 +33,15 @@ cat("\nMissing values in Charging Points:\n")
 colSums(is.na(charging_points_raw))
 cat("\nMissing values in Charging Sessions:\n")
 colSums(is.na(charging_session_raw))
+charging_session_raw <- charging_session_raw %>%
+  rename(Id = `CP ID`)
 ```
 
 ```{r}
-# Convert to sf object, set CRS to EPSG:27700
 charging_points_sf <- st_as_sf(charging_points_raw, coords = c("x", "y"), crs = 27700)
 
-# Transform to WGS84 (longitude/latitude)
 charging_points_latlon <- st_transform(charging_points_sf, 4326)
 
-# Extract coordinates back to columns
 coords <- st_coordinates(charging_points_latlon)
 charging_points_latlon$lon <- coords[, 1]
 charging_points_latlon$lat <- coords[, 2]
@@ -59,65 +58,22 @@ leaflet(data = charging_points_latlon) %>%
   setView(lng = mean(charging_points_latlon$lon), lat = mean(charging_points_latlon$lat), zoom = 12)
 ```
 
-```{r}
-charging_session_raw <- charging_session_raw %>%
-  rename(Id = `CP ID`)
-
-usage_count <- charging_session_raw %>%
-  count(Id, sort = TRUE) %>%
-  rename(num_sessions = n)
-```
-
-```{r}
-most_used_stations <- usage_count %>%
-  left_join(charging_points_raw, by = "Id")
-most_used_stations_clean <- most_used_stations %>%
-  filter(!is.na(x) & !is.na(y))
-
-# 2. Convert to lat/lon as before
-most_used_stations_sf <- st_as_sf(most_used_stations_clean, coords = c("x", "y"), crs = 27700)
-most_used_stations_latlon <- st_transform(most_used_stations_sf, 4326)
-coords <- st_coordinates(most_used_stations_latlon)
-most_used_stations_latlon$lon <- coords[, 1]
-most_used_stations_latlon$lat <- coords[, 2]
-pal <- colorNumeric(
-  palette = "YlOrRd", 
-  domain = most_used_stations_latlon$num_sessions
-)
-leaflet(data = most_used_stations_latlon) %>%
-  addProviderTiles(providers$OpenStreetMap) %>%
-  addCircleMarkers(
-    lng = ~lon, lat = ~lat,
-    radius = 10,
-    color = ~pal(num_sessions),
-    fillOpacity = 0.7,
-    label = ~paste("ID:", Id, "<br>Sessions:", num_sessions)
-  ) %>%
-  addLegend(
-    "bottomright",
-    pal = pal,
-    values = ~num_sessions,
-    title = "Number of Sessions"
-  ) %>%
-  setView(
-    lng = mean(most_used_stations_latlon$lon),
-    lat = mean(most_used_stations_latlon$lat),
-    zoom = 8
-  )
-```
+Most Used Stations, not needed!
 
 ```{r}
 library(lubridate)
 charging_session_raw <- charging_session_raw %>%
   mutate(StartMonth = month(`Start Date`, label = TRUE))
 
-# Plot
 charging_session_raw %>%
   count(StartMonth) %>%
   ggplot(aes(x = StartMonth, y = n)) +
     geom_col(fill = "steelblue") +
     labs(title = "Sessions by Month", y = "Number of Sessions")
 ```
+
+Session distribution over the day\
+-\> charging happens during the day
 
 ```{r}
 charging_session_raw <- charging_session_raw %>%
@@ -276,173 +232,19 @@ colnames(charging_points_raw)
 
 ```
 
-Bullshit ML Table:
-
-```{r}
-dir_out <- "../02_Processed_Data"
-if (!dir.exists(dir_out)) dir.create(dir_out, recursive = TRUE)
-
-# ----------------------------
-# 1) Session-level cleanup & core features
-# ----------------------------
-sessions <- charging_sessions_filtered %>%
-  # make sure duration fields exist & are clean
-  mutate(
-    StartDateTime = if (!"StartDateTime" %in% names(.))
-      ymd_hms(paste(`Start Date`, `Start Time`)) else StartDateTime,
-    EndDateTime   = if (!"EndDateTime" %in% names(.))
-      ymd_hms(paste(`End Date`, `End Time`)) else EndDateTime,
-    duration_minutes = if (!"duration_minutes" %in% names(.))
-      as.numeric(difftime(EndDateTime, StartDateTime, units = "mins")) else duration_minutes,
-    duration_hours   = duration_minutes / 60,
-    avg_power_kW     = if ("Total kWh" %in% names(.))
-                         `Total kWh` / pmax(duration_hours, 1e-9) else NA_real_
-  ) %>%
-  # keep plausible sessions (belt-and-suspenders even if done before)
-  filter(duration_minutes > 0, duration_minutes <= 1440) %>%
-  { if ("Total kWh" %in% names(.)) filter(., `Total kWh` > 0) else . } %>%
-  # temporal features
-  mutate(
-    hour_of_day = hour(StartDateTime),
-    day_of_week = wday(StartDateTime, label = TRUE, week_start = 1),  # Mon..Sun
-    is_weekend  = day_of_week %in% c("Sat", "Sun"),
-    month       = month(StartDateTime, label = TRUE),
-    quarter     = quarter(StartDateTime),
-    season      = case_when(
-      month(StartDateTime) %in%  c(12,1,2)  ~ "Winter",
-      month(StartDateTime) %in%  c(3,4,5)   ~ "Spring",
-      month(StartDateTime) %in%  c(6,7,8)   ~ "Summer",
-      TRUE                                ~ "Autumn"
-    )
-  )
-
-# ----------------------------
-# 2) Join station metadata
-# ----------------------------
-sessions_full <- sessions %>%
-  left_join(charging_points_raw, by = "Id")
-
-# ----------------------------
-# 3) Coordinates -> lon/lat (if needed)
-#    Set crs_input to your source CRS.
-#    If your x/y are already lon/lat, set crs_input <- 4326.
-# ----------------------------
-crs_input <- 27700  # set to 4326 if x/y already lon/lat
-
-# 0) Add a stable join key FIRST
-sessions_full <- sessions_full %>%
-  mutate(row_id___ = row_number())
-
-if (all(c("x","y") %in% names(sessions_full))) {
-
-  # 1) Subset rows with coords present, coerce to numeric
-  sf_pts <- sessions_full %>%
-    filter(!is.na(x) & !is.na(y)) %>%
-    mutate(
-      x = suppressWarnings(as.numeric(x)),
-      y = suppressWarnings(as.numeric(y))
-    )
-
-  # 2) If coords are already lon/lat (4326), just copy; else transform
-  if (crs_input == 4326) {
-    sf_pts_xy <- sf_pts %>%
-      transmute(row_id___, lon = x, lat = y)
-  } else {
-    sf_pts_wgs <- sf_pts %>%
-      st_as_sf(coords = c("x","y"), crs = crs_input, remove = TRUE) %>%
-      st_transform(4326)
-
-    coords <- st_coordinates(sf_pts_wgs)
-    sf_pts_xy <- sf_pts_wgs %>%
-      st_drop_geometry() %>%
-      mutate(lon = coords[,1], lat = coords[,2]) %>%
-      select(row_id___, lon, lat)
-  }
-
-  # 3) Join lon/lat back to ALL rows (rows without coords remain NA)
-  sessions_full <- sessions_full %>%
-    left_join(sf_pts_xy, by = "row_id___") %>%
-    select(-row_id___)
-}
-
-# ----------------------------
-# 4) Aggregates useful for modeling (utilization)
-#    Example: sessions/day per station
-# ----------------------------
-sessions_full <- sessions_full %>%
-  mutate(date = as_date(StartDateTime)) %>%
-  group_by(Id, date) %>%
-  mutate(
-    sessions_per_station_day = n(),
-    energy_per_station_day_kWh = if ("Total kWh" %in% names(.))
-                                   sum(`Total kWh`, na.rm = TRUE) else NA_real_
-  ) %>%
-  ungroup()
-
-# ----------------------------
-# 5) Keep a clean set of features for ML
-# ----------------------------
-# Choose features: (adjust to your needs)
-feat_cols <- c(
-  # IDs / keys
-  "Id", "Connector", "Site", "Model",
-  # target ideas (pick one later)
-  "duration_minutes", "duration_hours", "avg_power_kW", "Total kWh",
-  # temporal
-  "hour_of_day", "day_of_week", "is_weekend", "month", "quarter", "season",
-  # charger meta
-  "CH_SPEED", "CH_TYPE", "CON_TYPE", "CP_CHARGE", "USAGE_", "OUTPUT1_kW", "OUTPUT2_kW",
-  # geo
-  "lon", "lat",
-  # aggregates
-  "sessions_per_station_day", "energy_per_station_day_kWh"
-)
-
-# Keep only columns that exist
-feat_cols <- intersect(feat_cols, names(sessions_full))
-data_for_ml <- sessions_full %>% select(all_of(feat_cols))
-
-# ----------------------------
-# 6) One-hot encode categoricals & create model matrix
-# ----------------------------
-# Identify outcome later; here we just build an encoded feature table.
-rec <- recipe(~ ., data = data_for_ml) %>%
-  # (optional) keep IDs out of predictors
-  update_role(Id, new_role = "id") %>%
-  # make logicals numeric to avoid single-level factor issues
-  step_mutate(is_weekend = as.integer(is_weekend)) %>%
-  # drop zero-variance BEFORE dummies
-  step_zv(all_predictors()) %>%
-  # one-hot encode remaining categoricals
-  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
-  # normalize numerics
-  step_normalize(all_numeric_predictors())
-
-pp <- prep(rec, training = data_for_ml, verbose = FALSE)
-ml_matrix <- bake(pp, new_data = data_for_ml)
-
-# ----------------------------
-# 7) Save outputs
-# ----------------------------
-write_csv(sessions_full, file.path(dir_out, "sessions_enriched.csv"))
-write_csv(ml_matrix,    file.path(dir_out, "sessions_ml_matrix.csv"))
-
-# (Optional) also save the processing recipe to reapply at inference time
-saveRDS(pp, file.path(dir_out, "preprocess_recipe.rds"))
-```
-
 Correct Joined ML Ready Table:\
 
 ```{r}
 dir_out <- "../02_Processed_Data"
 if (!dir.exists(dir_out)) dir.create(dir_out, recursive = TRUE)
 
-
+# --- helper for datetime parsing
 parse_dt <- function(date_chr, time_chr) {
   x <- str_squish(paste0(date_chr, " ", time_chr))
   parse_date_time(x, orders = c("Y-m-d H:M:S", "Y-m-d H:M"), tz = "UTC", exact = FALSE)
 }
 
+# --- 1) Filter sessions ---
 charging_sessions_filtered <- charging_session_raw %>%
   mutate(
     StartDateTime = parse_dt(`Start Date`, `Start Time`),
@@ -453,15 +255,16 @@ charging_sessions_filtered <- charging_session_raw %>%
     duration_minutes = as.numeric(difftime(EndDateTime, StartDateTime, units = "mins")),
     duration_hours   = duration_minutes / 60
   ) %>%
-  
-  filter(duration_minutes > 0, duration_minutes <= 1440, `Total kWh` > 0, `Total kWh` <=100) %>%
+  filter(
+    duration_minutes > 0, duration_minutes <= 1440,
+    `Total kWh` > 0, `Total kWh` <= 100
+  ) %>%
   mutate(avg_power_kW = `Total kWh` / pmax(duration_hours, 1e-9))
 
 write_csv(charging_sessions_filtered, file.path(dir_out, "charging_sessions_filtered.csv"))
 
-#### ====== 2) STATION GEO: x/y -> lon/lat (set CRS HERE) ======
-crs_input <- 27700        # <-- CHANGE to 4326 if x/y already lon/lat
-
+# --- 2) Station geos (BNG -> WGS84 lon/lat) ---
+crs_input <- 27700
 cp_sf <- st_as_sf(charging_points_raw, coords = c("x","y"), crs = crs_input, remove = FALSE)
 cp_ll <- st_transform(cp_sf, 4326)
 coords <- st_coordinates(cp_ll)
@@ -469,17 +272,19 @@ coords <- st_coordinates(cp_ll)
 charging_points_geo <- charging_points_raw %>%
   mutate(lon = coords[,1], lat = coords[,2])
 
+# --- 3) Join sessions with station metadata ---
 sessions_full <- charging_sessions_filtered %>%
   left_join(
     charging_points_geo %>%
       select(Id, CP_Name, CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_,
              OUTPUT1_kW, OUTPUT2_kW, lon, lat),
     by = "Id"
-  )
+  ) %>%
+  drop_na()   # remove rows with NAs after join
 
 write_csv(sessions_full, file.path(dir_out, "sessions_enriched.csv"))
 
-
+# --- 4) Daily aggregates per station ---
 station_day <- sessions_full %>%
   mutate(date = as_date(StartDateTime)) %>%
   group_by(Id, date) %>%
@@ -499,70 +304,41 @@ station_day <- sessions_full %>%
   ) %>%
   arrange(Id, date) %>%
   group_by(Id) %>%
-  mutate(
-    sessions_lag_1d = lag(sessions_per_day, 1),
-    sessions_lag_7d = lag(sessions_per_day, 7),
-    energy_lag_1d   = lag(energy_per_day_kWh, 1),
-    energy_lag_7d   = lag(energy_per_day_kWh, 7),
-    sessions_roll7  = slide_dbl(sessions_per_day, mean, .before = 7, .complete = TRUE),
-    energy_roll7    = slide_dbl(energy_per_day_kWh, mean, .before = 7, .complete = TRUE)
-  ) %>%
   ungroup() %>%
-  # add static station meta once (if you want them at daily level too)
   left_join(
     charging_points_geo %>%
-      select(Id, CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_, OUTPUT1_kW, OUTPUT2_kW, lon, lat),
+      select(Id, CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_,
+             OUTPUT1_kW, OUTPUT2_kW, lon, lat),
     by = "Id"
-  )
+  ) %>%
+  drop_na()   # drop rows with any NA
 
 write_csv(station_day, file.path(dir_out, "station_day_enriched.csv"))
-
-
-station_day_model <- station_day %>%
-  filter(
-    !is.na(sessions_lag_1d), !is.na(energy_lag_1d),
-    !is.na(sessions_roll7),  !is.na(energy_roll7)
-  )
-
-write_csv(station_day_model, file.path(dir_out, "station_day_modelable.csv"))
-
-
-data_for_ml <- station_day_model %>%
-  select(
-    Id, date,
-    sessions_per_day, energy_per_day_kWh,
-    dow, is_weekend, month, year, week,
-    sessions_lag_1d, sessions_lag_7d, sessions_roll7,
-    energy_lag_1d, energy_lag_7d, energy_roll7,
-    CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_,
-    OUTPUT1_kW, OUTPUT2_kW, lon, lat
-  )
-
-rec <- recipe(~ ., data = data_for_ml) %>%
-  update_role(Id, date, new_role = "id") %>%
-  step_mutate(is_weekend = as.factor(is_weekend)) %>%
-  step_unknown(all_nominal_predictors(), new_level = "UNK") %>%  # safely handle NA factors
-  step_zv(all_predictors()) %>%                                  # drop single‑level cols BEFORE dummies
-  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
-  step_normalize(all_numeric_predictors())
-
-pp <- prep(rec, training = data_for_ml, verbose = FALSE)
-ml_matrix <- bake(pp, new_data = data_for_ml)
-
-write_csv(ml_matrix, file.path(dir_out, "station_day_ml_matrix.csv"))
-saveRDS(pp,        file.path(dir_out, "station_day_preprocess_recipe.rds"))
 
 cat("✅ Done.\n",
     "sessions_filtered:", nrow(charging_sessions_filtered), "rows\n",
     "sessions_enriched:", nrow(sessions_full), "rows\n",
-    "station_day:", nrow(station_day), "rows\n",
-    "station_day_modelable:", nrow(station_day_model), "rows\n",
-    "ML matrix:", nrow(ml_matrix), "x", ncol(ml_matrix), "\n")
+    "station_day:", nrow(station_day), "rows\n")
+```
+
+```{r}
+station_day %>%
+  group_by(date) %>%
+  summarise(total_sessions = sum(sessions_per_day), .groups = "drop") %>%
+  ggplot(aes(x = date, y = total_sessions)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  labs(
+    title = "Number of Charging Sessions per Day",
+    x = "Date",
+    y = "Sessions (all stations)"
+  ) +
+  theme_minimal()
 ```
 
 Adding shortest distance
 
 ```{r}
+
 # ==== packages ====
 library(dplyr)
 library(sf)
@@ -570,18 +346,15 @@ library(osmdata)
 library(dodgr)
 library(geodist)
 
-# --- stations (Id, lon, lat) in WGS84
 stations <- charging_points_geo %>%
   filter(!is.na(lon), !is.na(lat)) %>%
   distinct(Id, lon, lat)
 
 stations_sf <- st_as_sf(stations, coords = c("lon", "lat"), crs = 4326)
 
-# --- buffered bbox so the graph covers all stations
 bb_poly <- stations_sf %>% st_union() %>% st_transform(3857) %>% st_buffer(10000) %>% st_transform(4326)
 bb <- st_bbox(bb_poly)
-
-# --- download only DRIVABLE highways
+# get only streets where cars can drive through
 hw_keep <- c(
   "motorway","motorway_link","trunk","trunk_link","primary","primary_link",
   "secondary","secondary_link","tertiary","tertiary_link",
@@ -593,14 +366,12 @@ stopifnot(!is.null(roads), nrow(roads) > 0)
 bad <- c("construction","proposed","disused")
 if ("highway" %in% names(roads)) roads <- roads[!(roads$highway %in% bad), ]
 
-# --- build weighted graph (DO NOT contract here)
 graph <- weight_streetnet(roads, wt_profile = "motorcar")
 
-# --- use coordinates directly for distances (lon,lat as numeric matrix)
-xy <- st_coordinates(stations_sf)        # columns: X=lon, Y=lat
-dmat_m <- dodgr_dists(graph, from = xy, to = xy)  # meters
 
-# --- nearest OTHER station by road distance
+xy <- st_coordinates(stations_sf)        
+dmat_m <- dodgr_dists(graph, from = xy, to = xy) # in meters
+
 nearest_m <- apply(dmat_m, 1, function(v) {
   v <- as.numeric(v)
   vpos <- v[is.finite(v) & v > 0]
@@ -612,7 +383,6 @@ nn_df <- tibble::tibble(
   nearest_station_dist_km = nearest_m / 1000
 )
 
-# --- optional fallback: if any NA, fill with geodesic nearest
 if (anyNA(nn_df$nearest_station_dist_km)) {
   dist_geo <- st_distance(stations_sf, stations_sf)  # meters
   nearest_geo_m <- apply(dist_geo, 1, function(v) {
@@ -624,7 +394,6 @@ if (anyNA(nn_df$nearest_station_dist_km)) {
   nn_df$nearest_station_dist_km[fill] <- nearest_geo_m[fill] / 1000
 }
 
-# --- join back to daily table
 station_day <- station_day %>% left_join(nn_df, by = "Id")
 
 # quick check
@@ -632,199 +401,14 @@ summary(station_day$nearest_station_dist_km)
 
 ```
 
-FIRST ML run (gradient boosting):\
-\
-
-```{r}
-df <- station_day %>%
-  transmute(
-    Id, date,
-    log_energy = log1p(energy_per_day_kWh),
-    dow   = factor(wday(date, label = TRUE)),
-    month = factor(month(date)),
-    lon, lat,
-    nearest_station_dist_km,
-    CH_SPEED = factor(CH_SPEED),
-    CH_TYPE  = factor(CH_TYPE)
-  ) %>%
-  tidyr::drop_na(log_energy, dow, month, lon, lat, nearest_station_dist_km, CH_SPEED, CH_TYPE)
-
-X <- model.matrix(
-  log_energy ~ dow + month + lon + lat + nearest_station_dist_km + CH_SPEED + CH_TYPE - 1,
-  data = df
-)
-y <- df$log_energy
-
-cutoff <- as.Date("2019-07-01")
-if (!any(df$date < cutoff) || !any(df$date >= cutoff)) {
-
-  cutoff <- sort(unique(df$date))[floor(length(unique(df$date)) * 0.8)]
-}
-train_idx <- which(df$date < cutoff)
-
-dtrain <- xgb.DMatrix(data = X[train_idx, , drop = FALSE], label = y[train_idx])
-dtest  <- xgb.DMatrix(data = X[-train_idx, , drop = FALSE], label = y[-train_idx])
-
-params <- list(objective = "reg:squarederror", eval_metric = "rmse", eta = 0.1, max_depth = 6)
-bst <- xgb.train(
-  params = params,
-  data = dtrain,
-  nrounds = 500,
-  watchlist = list(train = dtrain, eval = dtest),
-  early_stopping_rounds = 20,
-  print_every_n = 10
-)
-
-pred_log <- predict(bst, dtest)
-pred_kWh <- expm1(pred_log)
-
-true_kWh <- expm1(y[-train_idx])
-rmse <- sqrt(mean((pred_kWh - true_kWh)^2))
-mae  <- mean(abs(pred_kWh - true_kWh))
-cat("Cutoff:", as.character(cutoff), "\nRMSE:", round(rmse,2), "kWh  MAE:", round(mae,2), "kWh\n")
-
-print(utils::head(xgb.importance(model = bst), 15))
-```
-
-```{r}
-stations <- charging_points_geo %>%
-  filter(!is.na(lon), !is.na(lat)) %>%
-  distinct(Id, lon, lat)
-
-stations_sf <- st_as_sf(stations, coords = c("lon","lat"), crs = 4326)
-
-# Work CRS in meters (for buffering/lengths)
-crs_m <- 3857
-stations_m <- st_transform(stations_sf, crs_m)
-
-# ==== (A) Population density in a ring around station ====
-# Provide a population raster (e.g., WorldPop/GEOSTAT) in WGS84:
-# Put your file at: ../01_Raw_Data/pop_density.tif  (people per km^2)
-pop_raster_path <- "../01_Raw_Data/pop_density.tif"   # <-- CHANGE to your file
-stopifnot(file.exists(pop_raster_path))
-pop_r <- rast(pop_raster_path)  # terra raster
-
-# buffer (meters)
-buf_pop_m <- 1000  # 1 km
-ring_pop_m <- 100  # inner hole to avoid exact point artifact; set 0 for full buffer
-
-# create ring polygons in meters, then back to WGS84 for terra::extract
-rings_m <- st_buffer(stations_m, buf_pop_m)
-if (ring_pop_m > 0) rings_m <- st_difference(rings_m, st_buffer(stations_m, ring_pop_m))
-rings_ll <- st_transform(rings_m, 4326)
-
-# extract mean pop density
-pop_vals <- terra::extract(pop_r, vect(rings_ll), fun = mean, na.rm = TRUE)
-# 'ID' is auto; align to stations by row
-stations_pop <- stations %>%
-  mutate(pop_density_mean_1km = pop_vals[[2]])  # 2nd column is the raster value
-
-# ==== (B) Road classification & density (OSM) ====
-# Download drivable highways within a big bbox covering all stations (+buffer)
-bbox_large <- st_bbox(st_buffer(st_transform(stations_sf, 4326), 0.2)) # ~0.2 degrees pad
-hw_keep <- c(
-  "motorway","motorway_link","trunk","trunk_link","primary","primary_link",
-  "secondary","secondary_link","tertiary","tertiary_link",
-  "unclassified","residential","living_street","service"
-)
-
-roads_osm <- opq(bbox = bbox_large) %>%
-  add_osm_feature(key = "highway", value = hw_keep) %>%
-  osmdata_sf()
-
-roads <- roads_osm$osm_lines
-stopifnot(!is.null(roads), nrow(roads) > 0)
-
-# clean & go to meter CRS
-bad <- c("construction","proposed","disused")
-if ("highway" %in% names(roads)) roads <- roads[!(roads$highway %in% bad), ]
-roads_m <- st_transform(roads, crs_m)
-stations_m <- st_transform(stations_sf, crs_m)  # ensure same CRS
-
-# (B1) nearest road class (categorical)
-nearest_idx <- st_nearest_feature(stations_m, roads_m)
-nearest_class <- roads_m$highway[nearest_idx]
-
-# (B2) road length by class within buffer
-buf_rd_m <- 500  # 500 m neighborhood
-neighb <- st_buffer(stations_m, buf_rd_m)
-
-# intersect once (faster than per-station loops)
-intersections <- st_intersection(roads_m, st_union(neighb))
-# compute lengths (in meters) by feature
-intersections$len_m <- as.numeric(st_length(intersections))
-
-# tag each piece with the station it belongs to (spatial join to which buffer)
-ints_to_station <- st_join(intersections, st_sf(station_id = stations$Id, geometry = neighb))
-# aggregate length by station & class
-road_len_by_class <- ints_to_station %>%
-  st_drop_geometry() %>%
-  group_by(station_id, highway) %>%
-  summarise(road_len_m = sum(len_m, na.rm = TRUE), .groups = "drop")
-
-# make wide (one col per class), also total density (m per km^2) in the buffer
-buf_area_km2 <- set_units(pi * (buf_rd_m^2), m^2)
-buf_area_km2 <- as.numeric(set_units(buf_area_km2, km^2))
-road_len_wide <- tidyr::pivot_wider(
-  road_len_by_class,
-  id_cols = station_id,
-  names_from = highway,
-  values_from = road_len_m,
-  values_fill = 0
-) %>%
-  mutate(
-    road_len_total_m = rowSums(across(where(is.numeric))),
-    road_density_m_per_km2 = road_len_total_m / buf_area_km2
-  ) %>%
-  rename(Id = station_id)
-
-# ==== (C) Distance to nearest city/town center (OSM) ====
-# Query city & town places (points/polygons)
-places <- opq(bbox = bbox_large) %>%
-  add_osm_feature(key = "place", value = c("city","town")) %>%
-  osmdata_sf()
-
-# unify points & polygon centroids
-cities_pts <- places$osm_points
-cities_poly <- places$osm_multipolygons
-cities <- list()
-
-if (!is.null(cities_pts) && nrow(cities_pts) > 0) {
-  cities[[length(cities)+1]] <- st_transform(cities_pts, 4326) %>% select(name, place, geometry)
-}
-if (!is.null(cities_poly) && nrow(cities_poly) > 0) {
-  cent <- st_point_on_surface(st_transform(cities_poly, 4326))
-  cities[[length(cities)+1]] <- cent %>% select(name, place, geometry)
-}
-stopifnot(length(cities) > 0)
-cities_all <- do.call(rbind, cities)
-
-# compute nearest city distance (km)
-dist_mat <- st_distance(stations_sf, cities_all)  # meters
-nearest_city_km <- apply(dist_mat, 1, function(v) {
-  v <- as.numeric(v)
-  if (all(!is.finite(v))) NA_real_ else min(v, na.rm = TRUE) / 1000
-})
-
-# ==== (D) collect all station-level features ====
-stations_features <- stations_pop %>%
-  mutate(nearest_road_class = nearest_class,
-         dist_to_city_km = nearest_city_km) %>%
-  left_join(road_len_wide, by = "Id")
-
-# ==== (E) join into station_day ====
-station_day <- station_day %>%
-  left_join(stations_features, by = "Id")
-```
-
 Population Data ; Feature engineering:\
 
 ```{r}
-# 0) Stations (WGS84 + BNG)
+library(terra)
+
 stations_ll  <- st_as_sf(charging_points_geo, coords = c("lon","lat"), crs = 4326, remove = FALSE)
 stations_bng <- st_transform(stations_ll, 27700)
 
-# 1) Crop & reproject raster to BNG
 buf_m  <- 10000
 area_bng <- st_buffer(st_union(stations_bng), buf_m)
 bb_ll   <- st_bbox(st_transform(area_bng, 4326))
@@ -834,8 +418,8 @@ pop_r_ll <- rast(pop_path)
 pop_r_cr <- crop(pop_r_ll, ext(bb_ll))
 pop_r_bng <- project(pop_r_cr, "EPSG:27700", method = "bilinear")
 
-# 2) Build rings **rowwise** so we get exactly one ring per station
-outer_list <- lapply(st_geometry(stations_bng), function(g) st_buffer(g, 1000))
+
+outer_list <- lapply(st_geometry(stations_bng), function(g) st_buffer(g, 50000))
 inner_list <- lapply(st_geometry(stations_bng), function(g) st_buffer(g,  100))
 ring_list  <- Map(st_difference, outer_list, inner_list)
 rings_bng  <- st_sfc(ring_list, crs = 27700)                  # length == nrow(stations_bng)
@@ -851,36 +435,83 @@ stopifnot(length(pop_mean) == nrow(stations_ll))  # safety check
 # 4) Attach to stations, then to station_day
 station_pop <- charging_points_geo %>%
   distinct(Id, lon, lat) %>%
-  mutate(pop_density_mean_1km = pop_mean)
+  mutate(pop_density_mean_50km = pop_mean)
 
 station_day <- station_day %>%
   left_join(station_pop, by = "Id")
 ```
 
 ```{r}
-length(ring_list)        
-nrow(pop_df)             
+library(sf)
+library(terra)
+library(dplyr)
+
+# --- 0) Stations (WGS84 + BNG) ---
+stations_ll  <- st_as_sf(charging_points_geo, coords = c("lon","lat"), crs = 4326, remove = FALSE)
+stations_bng <- st_transform(stations_ll, 27700)  # British National Grid (meters)
+
+# --- 1) Prep population raster (crop to AOI, reproject to BNG) ---
+buf_m  <- 10000  # 10 km pad around all stations for cropping
+area_bng <- st_buffer(st_union(stations_bng), buf_m)
+bb_ll   <- st_bbox(st_transform(area_bng, 4326))
+
+pop_path <- "../01_Raw_Data/population_UK.tif"  # <-- your file
+pop_r_ll <- rast(pop_path)
+pop_r_cr <- crop(pop_r_ll, ext(bb_ll))
+pop_r_bng <- project(pop_r_cr, "EPSG:27700", method = "bilinear")
+
+# --- 2) Helper: mean population within a buffer radius (meters) ---
+mean_pop_in_radius <- function(stations_bng, pop_r_bng, radius_m) {
+  # build one polygon per station
+  polys <- st_buffer(st_geometry(stations_bng), radius_m)
+  v     <- vect(st_sfc(polys, crs = 27700))
+  vals  <- terra::extract(pop_r_bng, v, fun = mean, na.rm = TRUE)
+  as.numeric(vals[[2]])  # second column holds the raster values
+}
+
+# Compute both radii
+pop_mean_1km  <- mean_pop_in_radius(stations_bng, pop_r_bng,  1000)
+pop_mean_10km <- mean_pop_in_radius(stations_bng, pop_r_bng, 10000)
+
+stopifnot(length(pop_mean_1km)  == nrow(stations_bng))
+stopifnot(length(pop_mean_10km) == nrow(stations_bng))
+
+# --- 3) Attach to stations, then join to station_day ---
+station_pop <- charging_points_geo %>%
+  distinct(Id, lon, lat) %>%
+  mutate(
+    pop_density_mean_1km  = pop_mean_1km,
+    pop_density_mean_10km = pop_mean_10km
+  )
+
+station_day <- station_day %>%
+  left_join(station_pop, by = "Id")
+```
+
+```{r}
+        
 summary(station_day$pop_density_mean_1km)
+summary(station_day$pop_density_mean_10km)
+summary(station_day$pop_density_mean_50km)
 
 ```
 
 ```{r}
+library(osmdata)
+library(sf)
+library(units)
 
-# ---- inputs ----
-# If you have charging_points_geo, derive 'stations' from it:
 stations <- charging_points_geo %>%
   filter(!is.na(lon), !is.na(lat)) %>%
   distinct(Id, lon, lat)
 
-# CRS for metric work in Scotland/GB
-crs_m <- 27700   # British National Grid (meters)
 
-# Station points in both CRSs
+crs_m <- 27700   
+
 stations_sf <- st_as_sf(stations, coords = c("lon","lat"), crs = 4326)
 stations_m  <- st_transform(stations_sf, crs_m)
 
-# ---- (1) OSM ROADS: nearest class + road density by class within buffer ----
-# bbox with small pad in degrees (for OSM query)
+
 bbox_large <- st_bbox(st_buffer(stations_sf, 0.2))  # ~0.2° pad
 
 hw_keep <- c(
@@ -936,7 +567,6 @@ road_len_wide <- pivot_wider(
   ) %>%
   rename(Id = station_id)
 
-# ---- (2) OSM PLACES: distance to nearest city/town center ----
 places <- opq(bbox = bbox_large) %>%
   add_osm_feature(key = "place", value = c("city","town")) %>%
   osmdata_sf()
@@ -959,114 +589,22 @@ nearest_city_km <- apply(dist_mat, 1, function(v) {
   if (all(!is.finite(v))) NA_real_ else min(v, na.rm = TRUE) / 1000
 })
 
-# ---- (3) Assemble station-level features ----
 stations_features <- stations %>%
-  mutate(nearest_road_class = nearest_class,
-         dist_to_city_km    = nearest_city_km) %>%
+  mutate(
+    nearest_road_class = nearest_class,
+    dist_to_city_km    = nearest_city_km
+  ) %>%
   left_join(road_len_wide, by = "Id")
 
-# If you also have population from your earlier step:
-# stations_features <- stations_features %>%
-#   left_join(stations_pop %>% select(Id, pop_density_mean_1km), by = "Id")
+stopifnot(nrow(stations_features) == nrow(stations)) 
+summary(stations_features$road_density_m_per_km2)
 
-# ---- (4) Join onto station_day ----
+
 station_day <- station_day %>%
   left_join(stations_features, by = "Id")
 ```
 
 ```{r}
-
-# --- 1) Coalesce duplicated coords & build clean feature table ---
-df <- station_day %>%
-  mutate(
-    lon_final = coalesce(lon, lon.x, lon.y),
-    lat_final = coalesce(lat, lat.x, lat.y),
-    dow   = factor(dow),             # ensure factor
-    month = factor(month),
-    CH_SPEED = factor(CH_SPEED),
-    CH_TYPE  = factor(CH_TYPE),
-    CON_TYPE = factor(CON_TYPE),
-    CP_CHARGE = factor(CP_CHARGE),
-    USAGE_    = factor(USAGE_),
-    nearest_road_class = factor(nearest_road_class),
-    log_energy = log1p(energy_per_day_kWh)
-  ) %>%
-  # keep the predictors we want
-  select(
-    Id, date,
-    log_energy,
-    # temporal
-    dow, month, year, week, is_weekend,
-    # lags/rolls (very predictive)
-    sessions_lag_1d, sessions_lag_7d, sessions_roll7,
-    energy_lag_1d,   energy_lag_7d,   energy_roll7,
-    # static charger meta
-    CH_SPEED, CH_TYPE, CON_TYPE, CP_CHARGE, USAGE_,
-    OUTPUT1_kW, OUTPUT2_kW,
-    # spatial
-    lon_final, lat_final, nearest_station_dist_km, dist_to_city_km,
-    pop_density_mean_1km,
-    road_density_m_per_km2, road_len_total_m,
-    nearest_road_class,
-    # optional: per-class road lengths (will be numeric)
-    motorway, motorway_link, trunk, primary, secondary,
-    tertiary, residential, service, unclassified
-  ) %>%
-  # make logical usable
-  mutate(is_weekend = as.integer(is_weekend)) %>%
-  # drop rows with any missing predictors/target
-  drop_na()
-
-# --- 2) Design matrix (one-hot for factors; no intercept) ---
-X <- model.matrix(
-  log_energy ~ . - Id - date - 1,  # keep Id/date out of predictors
-  data = df
-)
-y <- df$log_energy
-
-# --- 3) Time-based split (use your cutoff) ---
-cutoff <- as.Date("2019-07-01")
-if (!any(df$date < cutoff) || !any(df$date >= cutoff)) {
-  # fallback: 80/20 split by time if that date leaves one side empty
-  udates <- sort(unique(df$date))
-  cutoff <- udates[floor(length(udates) * 0.8)]
-}
-train_idx <- which(df$date < cutoff)
-
-dtrain <- xgb.DMatrix(data = X[train_idx, , drop = FALSE], label = y[train_idx])
-dtest  <- xgb.DMatrix(data = X[-train_idx, , drop = FALSE], label = y[-train_idx])
-
-# --- 4) Train xgboost baseline ---
-params <- list(
-  objective = "reg:squarederror",
-  eval_metric = "rmse",
-  eta = 0.1,
-  max_depth = 6,
-  subsample = 0.8,
-  colsample_bytree = 0.8
-)
-
-bst <- xgb.train(
-  params = params,
-  data = dtrain,
-  nrounds = 600,
-  watchlist = list(train = dtrain, eval = dtest),
-  early_stopping_rounds = 30,
-  print_every_n = 20
-)
-
-# --- 5) Predict & evaluate on test set (back-transform to kWh) ---
-pred_log <- predict(bst, dtest)
-pred_kWh <- expm1(pred_log)
-true_kWh <- expm1(y[-train_idx])
-
-rmse <- sqrt(mean((pred_kWh - true_kWh)^2))
-mae  <- mean(abs(pred_kWh - true_kWh))
-cat("Cutoff:", as.character(cutoff),
-    "\nRMSE:", round(rmse, 2), "kWh   MAE:", round(mae, 2), "kWh\n")
-
-# --- 6) Feature importance (top 20) ---
-print(utils::head(xgb.importance(model = bst), 20))
+colnames(station_day)
+write_csv(station_day, file.path(dir_out, "station_day_rdy.csv"))
 ```
-
-Total overfitted i guuess. need to clean this crazy stuff.
