@@ -33,8 +33,26 @@ cat("\nMissing values in Charging Points:\n")
 colSums(is.na(charging_points_raw))
 cat("\nMissing values in Charging Sessions:\n")
 colSums(is.na(charging_session_raw))
+
+
 charging_session_raw <- charging_session_raw %>%
   rename(Id = `CP ID`)
+charging_points_raw <- charging_points_raw[!is.na(charging_points_raw$Id), ]
+
+distinct_id_count <- length(unique(charging_points_raw$Id))
+cat("Distinct IDs:", distinct_id_count, "\n")
+
+distinct_xy_count <- nrow(unique(charging_points_raw[, c("x", "y")]))
+cat("Distinct (x, y) combinations:", distinct_xy_count, "\n")
+ggplot(charging_points_raw, aes(x = x, y = y)) +
+  geom_point(alpha = 0.6, color = "blue", size = 0.1) +
+  labs(
+    title = "Charging Points Locations",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+
 ```
 
 ```{r}
